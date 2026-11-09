@@ -1,0 +1,126 @@
+# CI — replaces the GitLab pipeline removed when this project moved to GitHub.
+#
+# WHAT THE OLD ONE DID, so nothing is quietly lost: a backend syntax check, a
+# require check, the service-core unit suites, a frontend build, and SAST +
+# secret detection. All of that is below.
+#
+# WHAT IT DID NOT DO, and this one does: run the frontend test suites. The old
+# pipeline defined a frontend-tests job but the ~109 suites never actually ran,
+# which LAUNCH_PLAN.md recorded as a known gap. They run here.
+#
+# WHAT IS DELIBERATELY NOT HERE: the black-box HTTP suites and the Playwright
+# e2e suite. Both drive a LIVE stack — 23 containers, Keycloak, Kong, Mongo,
+# Redis — and asserting against a stack this job would have to stand up first
+# is a different and much slower piece of work. Until that exists,
+# scripts/run-api-tests.sh on a real environment remains the verification step
+# before a change is called done, exactly as it is today. Saying so here is
+# better than implying a green tick covers more than it does.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to the same PR cancels the first: these jobs take minutes and
+# only the latest commit's result is worth anything.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend-syntax:
+    name: backend — syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # `node --check` is cheap and catches real breakage immediately, but it
+      # verifies SYNTAX ONLY. It does not catch a require() of a file that does
+      # not exist — which is exactly the bug class that broke defectService
+      # (WP-001), so the require check below is a separate, necessary job.
+      - name: node --check every backend source file
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS= read -r f; do
+            node --check "$f"
+            count=$((count+1))
+          done < <(find backend -name '*.js' -not -path '*/node_modules/*' -not -path '*/coverage/*')
+          echo "checked $count files"
+
+  backend-requires:
+    name: backend — require graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node scripts/check-requires.js
+
+  service-core:
+    name: backend — service-core unit suites
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/shared/service-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci || npm install
+      # Plain `npm test` runs jest, which here is the pure unit suites. The
+      # *.live.test.js files need a running stack and are excluded by the
+      # separate test:live script, so they cannot accidentally run and fail
+      # here for want of infrastructure.
+      - run: npm test
+
+  frontend:
+    name: frontend — tests and production build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci || npm install
+      # CI=true makes CRA non-interactive AND treats warnings as errors in the
+      # build, which is what the old pipeline's frontend-build job relied on.
+      - name: tests
+        run: npm test -- --watchAll=false
+        env:
+          CI: true
+      - name: production build
+        run: npm run build
+        env:
+          CI: true
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history to scan commits, not just the tree. This
+          # repo starts from a single commit precisely because the previous
+          # history carried live credentials, so keeping it clean from here is
+          # the point of this job.
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
