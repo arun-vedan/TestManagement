@@ -22,7 +22,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .idea
-package-lock.json
+# package-lock.json is COMMITTED, deliberately. It was ignored here
+# among .idea and log files, with no comment, which reads as inherited
+# boilerplate rather than a decision. Without it CI resolves newer
+# dependency versions than any developer has, and MUI DataGrid then
+# fails 9 traceability tests with "Failed to execute 'contains' on
+# 'Node'" — proven by running the same suite in the same container
+# with and without the lock: 9 failures vs 29 passes.
 
 # WP-063: Playwright E2E — real login storage state (has live tokens) and
 # generated run artifacts, never committed.
