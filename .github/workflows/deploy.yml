@@ -1,0 +1,156 @@
+# Build every image and publish it to GHCR, then deploy.
+#
+# BUILDS HERE, NOT ON THE SERVER. The VPS has 2 vCPU and no source tree.
+# Building 18 Node images plus a CRA bundle there takes tens of minutes and
+# can OOM mid-deploy, which would take the running site down with it. Actions
+# builds in parallel on throwaway runners; the VPS only pulls and restarts.
+#
+# GHCR needs no extra account or credential: packages:write on the built-in
+# GITHUB_TOKEN is enough, and images inherit the repository's visibility.
+
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy after building"
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt a deploy mid-flight
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  backend:
+    name: build ${{ matrix.svc.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false    # one bad service should not hide the other 17
+      matrix:
+        svc:
+          - { name: aiservice, dockerfile: aiService/dockerfile }
+          - { name: automationservice, dockerfile: automationService/dockerfile }
+          - { name: commentsservice, dockerfile: commentsService/dockerfile }
+          - { name: defectservice, dockerfile: defectService/dockerfile }
+          - { name: fieldsservice, dockerfile: fieldsService/dockerfile }
+          - { name: folderservice, dockerfile: folderService/dockerfile }
+          - { name: istatusservice, dockerfile: statusService/dockerfile }
+          - { name: linkissueservice, dockerfile: linkIssueService/dockerfile }
+          - { name: moduleservice, dockerfile: moduleService/dockerfile }
+          - { name: notificationservice, dockerfile: notificationService/dockerfile }
+          - { name: objectrepo, dockerfile: objectRepo/dockerfile }
+          - { name: releaseservice, dockerfile: releaseService/dockerfile }
+          - { name: reportingservice, dockerfile: reportingService/dockerfile }
+          - { name: requirementservice, dockerfile: requirementService/dockerfile }
+          - { name: testplanexecutionservice, dockerfile: testPlanExecutionService/dockerfile }
+          - { name: testreposervice, dockerfile: testRepoService/dockerfile }
+          - { name: uploadservice, dockerfile: uploadService/dockerfile }
+          - { name: userservice, dockerfile: userService/dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          # backend/ is the context, not the service directory: every
+          # dockerfile reaches up into shared/service-core, which is outside
+          # its own folder.
+          context: backend
+          file: backend/${{ matrix.svc.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/testmanagement/${{ matrix.svc.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/testmanagement/${{ matrix.svc.name }}:latest
+          # Layer cache in the registry, so a one-line change does not
+          # reinstall node_modules for all 18 services.
+          cache-from: type=gha,scope=${{ matrix.svc.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.svc.name }}
+
+  frontend:
+    name: build frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: true
+          # CRA inlines these into the bundle AT BUILD TIME. They cannot be
+          # changed later by setting a container variable, which is why the
+          # image is environment-specific and these are build args.
+          build-args: |
+            REACT_APP_API_BASE_URL=https://${{ vars.API_HOST || 'api.vedan.io' }}
+            REACT_APP_KEYCLOAK_BASE_URL=https://${{ vars.AUTH_HOST || 'auth.vedan.io' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/testmanagement/frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/testmanagement/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy:
+    name: deploy to VPS
+    needs: [backend, frontend]
+    if: github.event_name == 'push' || inputs.deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: copy compose files to the server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "deploy/docker-compose.prod.yml,deploy/docker-compose.edge.yml"
+          target: /opt/vedan
+          strip_components: 1
+
+      - name: pull and restart
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/vedan
+            # .env lives ONLY on the server and is never in the repo or in
+            # this workflow: it holds the Keycloak secret, Mongo passwords
+            # and the credential keys.
+            test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
+            echo "IMAGE_TAG=${{ github.sha }}" > .env.tag
+            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+            docker compose --env-file .env --env-file .env.tag \
+              -f docker-compose.prod.yml -f docker-compose.edge.yml pull --quiet
+            docker compose --env-file .env --env-file .env.tag \
+              -f docker-compose.prod.yml -f docker-compose.edge.yml up -d --remove-orphans
+            # Images accumulate fast with 19 of them per deploy; the VPS has
+            # 96 GB but an unpruned host fills quietly and then nothing starts.
+            docker image prune -f --filter "until=168h"
+            docker compose -f docker-compose.prod.yml -f docker-compose.edge.yml ps
