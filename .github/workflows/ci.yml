@@ -77,7 +77,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm ci || npm install
+      - run: npm install --no-audit --no-fund
       # Plain `npm test` runs jest, which here is the pure unit suites. The
       # *.live.test.js files need a running stack and are excluded by the
       # separate test:live script, so they cannot accidentally run and fail
@@ -92,12 +92,19 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v4
+      # No `cache: npm` here on purpose. setup-node's npm cache hashes a
+      # lock file, and this repo commits none — frontend/.gitignore:25
+      # excludes package-lock.json. With the cache enabled the STEP ITSELF
+      # fails ("Dependencies lock file is not found"), before a single test
+      # runs, which is exactly how this job failed on its first run.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci || npm install
+      # `npm ci` also requires a lock file, so plain install it is. That
+      # means CI resolves versions fresh each run and can legitimately
+      # differ from a developer's machine — a real cost of not committing
+      # lock files, noted here rather than hidden.
+      - run: npm install --no-audit --no-fund
       # CI=true makes CRA non-interactive AND treats warnings as errors in the
       # build, which is what the old pipeline's frontend-build job relied on.
       - name: tests

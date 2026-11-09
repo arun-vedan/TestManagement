@@ -18,7 +18,12 @@ WORKDIR /app
 
 # Dependencies first, so a source-only change does not reinstall them.
 COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund
+# `npm ci` requires a lock file and this repo commits none —
+# frontend/.gitignore:25 excludes package-lock.json. It works on a
+# developer's machine, where the lock exists on disk, and fails in CI,
+# where the context is the git checkout. Fall back rather than depend on
+# a file that is deliberately not tracked.
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
 COPY . .
 
