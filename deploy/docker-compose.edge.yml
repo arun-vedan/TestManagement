@@ -1,0 +1,118 @@
+# The edge: TLS termination, routing, and the frontend.
+#
+# Hand-written, unlike docker-compose.prod.yml, because none of this has a
+# development counterpart to drift from — in dev you reach the frontend on
+# :3000, Kong on :8000 and Keycloak on :8080 directly, with no proxy at all.
+#
+# Used together with the generated file, later file wins:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.edge.yml up -d
+#
+# WHY A REVERSE PROXY AT ALL, rather than publishing three ports: Let's
+# Encrypt certificates, one public port instead of three, and — the one that
+# actually forces it — Keycloak must be reached on the SAME origin that it
+# issues tokens for. Browsers and the token validator both care, and
+# `https://host:3443` (what frontend/.env.production still said) is blocked
+# by many corporate networks, which would fail the first customer demo from
+# inside one.
+
+services:
+  traefik:
+    image: traefik:v3.2
+    container_name: traefik
+    restart: unless-stopped
+    mem_limit: 128m
+    command:
+      - --providers.docker=true
+      # Opt-in: a container is only routed if it carries traefik.enable=true.
+      # Without this, all 23 backend services would get default routes
+      # published to the internet.
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=src-kube-network
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      # Everything on 80 is redirected to 443, except the ACME challenge,
+      # which Traefik serves on 80 itself before this rule applies.
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      # Uncomment ONLY while debugging certificate issuance. Let's Encrypt
+      # rate-limits failures hard (5 per hostname per week), and burning that
+      # allowance on a typo locks you out of the real certificate for days.
+      # - --certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Read-only: Traefik only needs to watch for container labels. A
+      # writable docker socket in a public-facing container is root on the
+      # host for anyone who gets into it.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+    networks:
+      - src-kube-network
+
+  frontend:
+    image: ghcr.io/arun-vedan/testmanagement/frontend:${IMAGE_TAG:-latest}
+    container_name: frontend
+    restart: unless-stopped
+    mem_limit: 128m
+    networks:
+      - src-kube-network
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=Host(`${APP_HOST}`)
+      - traefik.http.routers.frontend.entrypoints=websecure
+      - traefik.http.routers.frontend.tls.certresolver=le
+      - traefik.http.services.frontend.loadbalancer.server.port=80
+
+  kong:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kong.rule=Host(`${API_HOST}`)
+      - traefik.http.routers.kong.entrypoints=websecure
+      - traefik.http.routers.kong.tls.certresolver=le
+      # Kong's proxy port, not its admin port. 8001 is the admin API and was
+      # found unauthenticated on 0.0.0.0 earlier in this project's history;
+      # it must never be routed.
+      - traefik.http.services.kong.loadbalancer.server.port=8000
+
+  keycloak:
+    # start-dev is for development: it permits plain HTTP, disables caching
+    # and is explicitly not supported in production. The dev compose uses it
+    # with theme caching off so template edits appear instantly; here the
+    # theme ships in the image and should be cached.
+    command:
+      - start
+      - --optimized=false
+      - --spi-theme-static-max-age=2592000
+      - --spi-theme-cache-themes=true
+      - --spi-theme-cache-templates=true
+    environment:
+      # Hostname v2. KC_HOSTNAME is the public URL Keycloak believes it is
+      # reachable at; it goes into the token issuer and every redirect. Get
+      # it wrong and login appears to work, then fails validation downstream.
+      KC_HOSTNAME: https://${AUTH_HOST}
+      # Traefik terminates TLS and speaks HTTP to this container. Without
+      # KC_PROXY_HEADERS Keycloak sees an http:// request and builds http://
+      # redirects, producing a redirect loop the moment a browser follows one.
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.keycloak.rule=Host(`${AUTH_HOST}`)
+      - traefik.http.routers.keycloak.entrypoints=websecure
+      - traefik.http.routers.keycloak.tls.certresolver=le
+      - traefik.http.services.keycloak.loadbalancer.server.port=8080
+
+volumes:
+  traefik-letsencrypt:
+
+networks:
+  src-kube-network:
+    external: true

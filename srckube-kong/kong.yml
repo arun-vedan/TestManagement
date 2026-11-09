@@ -1875,7 +1875,11 @@ plugins:
   enabled: true
   config:
     origins:
+    # WP-150 — the deployed origin must be listed or every /api/v1/*
+    # call fails CORS preflight from the browser. localhost stays so a
+    # developer running `npm start` against this gateway still works.
     - http://localhost:3000
+    - https://app.vedan.io
     methods:
     - GET
     - POST
