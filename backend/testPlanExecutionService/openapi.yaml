@@ -1,0 +1,534 @@
+openapi: 3.0.3
+info:
+  title: testPlanExecutionService
+  description: >
+    Test plans + test execution runs (WP-062, ADR-007 — hand-authored, not
+    generated; updated WP-021b). Two routers mounted on one service:
+    /api/v1/testplan (backend/testPlanExecutionService/routes/testplan.js)
+    and /api/v1/testexecution (backend/testPlanExecutionService/routes/
+    testexecution.js). Kong host: testplanexecutionservice.
+
+    **WP-021b — tenant scoping, closing a prior gap**: WP-062 originally
+    documented a discrepancy here — unlike testRepoService/
+    requirementService/defectService, neither router called
+    requireProjectScope() on its main CRUD routes, so every authenticated
+    user could read/write every project's plans and executions through
+    this service. WP-021 had rolled requireProjectScope() out to three
+    services and explicitly deferred "the rest" (see this repo's
+    EXECUTION_LOG.md); this service was that deferred rest. WP-021b closes
+    it: both TestPlan and TestExecution now carry a `projectId` field
+    (additive, backfilled to the Default Project id=1 for every
+    pre-existing document — 7 TestPlans, 14 TestExecutions), and every
+    route below runs keycloak.protect() -> requireProjectScope() ->
+    authorize(action), the same chain testRepoService/requirementService/
+    defectService already use. X-Project-Id is now REQUIRED on every route
+    in this file, including the ones that used to be the exception
+    (POST /api/v1/testexecution/ingest, WP-033 — see that path's own
+    description for what stays specific to it: API-key auth and the
+    "lands in the key's bound project" guarantee).
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service. POST /ingest additionally accepts an
+        X-Api-Key credential (see that path).
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: >
+        Accepted ONLY on POST /api/v1/testexecution/ingest (WP-033), as an
+        alternative to a Keycloak bearer — see service-core/middleware/
+        apiKeyAuth.js. No other route in this service accepts this header.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: >
+        Numeric project id (WP-021b). Required on every route in this
+        file. Missing/non-integer/foreign-project/non-member all return
+        403, not 400 (service-core/middleware/projectScope.js).
+      schema:
+        type: integer
+    PlanId:
+      name: id
+      in: path
+      required: true
+      description: The TestPlan document's Mongo _id — not the human-readable TestPlanId (e.g. "PLN-1").
+      schema: { type: string }
+    ExecutionId:
+      name: id
+      in: path
+      required: true
+      description: The TestExecution document's Mongo _id — not the human-readable TestExecutionId (e.g. "Run-1").
+      schema: { type: string }
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403:
+      description: Direct-to-service auth rejection, or a WP-021b X-Project-Id problem (missing/non-integer/unknown/non-member).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound404:
+      description: Resource not found (or belongs to a different project — indistinguishable by design, WP-021b).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadRequest400:
+      description: Validation error, or a list-route filter value that could not be cast to its field's schema type (WP-013b).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    TestPlanTestCase:
+      type: object
+      properties:
+        id: { type: integer }
+        TestCaseId: { type: string }
+        TestCaseSummary: { type: string }
+        TestStatus: { type: string }
+    TestPlan:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params.'
+      properties:
+        _id: { type: string }
+        id: { type: integer }
+        projectId: { type: integer, description: 'WP-021b tenant scope, stamped server-side from the verified X-Project-Id header.' }
+        TestPlanId: { type: string, description: 'Human-readable business id, e.g. "PLN-1".' }
+        parentId: { type: integer }
+        TestCases:
+          type: array
+          items: { $ref: '#/components/schemas/TestPlanTestCase' }
+        createdBy: { type: string, description: Keycloak sub, stored as an ObjectId-typed field. }
+        updatedBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, TestPlanId, projectId]
+    TestPlanList:
+      type: object
+      description: shared advancedResults() envelope — see service-core/middleware/advancedResults.js. Tenant-filtered (WP-021b) — folds req.projectScope.projectId into the Mongo filter automatically.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination:
+          type: object
+          properties:
+            next: { type: object }
+            prev: { type: object }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TestPlan' }
+    TestPlanSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/TestPlan' }
+    ExecutionTestStep:
+      type: object
+      properties:
+        testStep: { type: string }
+        Expected: { type: string }
+        status: { type: string }
+    ExecutionTestCase:
+      type: object
+      properties:
+        id: { type: integer }
+        TestCaseId: { type: string }
+        TestCaseSummary: { type: string }
+        TestStatus: { type: string }
+        TestCaseDescription: { type: string }
+        TestSteps:
+          type: array
+          items: { $ref: '#/components/schemas/ExecutionTestStep' }
+        attachment: { type: array, items: { type: object } }
+        dynamicFields: { type: object }
+        parentId: { type: integer }
+        durationMs: { type: integer, description: WP-033 CI-ingest field. }
+        startedAt: { type: string, format: date-time }
+        errorMessage: { type: string }
+        ciEnvironment: { type: string }
+    TestExecution:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params.'
+      properties:
+        _id: { type: string }
+        id: { type: integer }
+        projectId: { type: integer, description: 'WP-021b tenant scope. For a human-created execution, stamped from the verified X-Project-Id header; for a CI-ingested one (POST /ingest), stamped from the API key''s own bound projectId — never a client-supplied value either way.' }
+        TestExecutionId: { type: string, description: 'Human-readable business id, e.g. "Run-1".' }
+        TestPlanId: { type: string, description: References TestPlan._id (ObjectId) — NOT the human-readable TestPlanId string. }
+        environmentId: { type: integer, description: 'WP-025 cross-service reference to releaseService''s Environment.id (by id only, no FK/populate).' }
+        assignedTo: { type: string }
+        TestCases:
+          type: array
+          items: { $ref: '#/components/schemas/ExecutionTestCase' }
+        source: { type: string, enum: [ui, ci], description: Defaults to "ui"; "ci" only via POST /ingest. }
+        ciRunUrl: { type: string }
+        createdBy: { type: string }
+        updatedBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, TestExecutionId, projectId]
+    TestExecutionList:
+      type: object
+      description: shared advancedResults() envelope. Tenant-filtered (WP-021b) — folds req.projectScope.projectId into the Mongo filter automatically.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination: { type: object }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/TestExecution' }
+    TestExecutionSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/TestExecution' }
+    IngestFieldError:
+      type: object
+      properties:
+        field: { type: string }
+        message: { type: string }
+
+paths:
+  /api/v1/testplan:
+    get:
+      summary: List test plans (tenant-scoped, WP-021b)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestPlanList' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create a test plan
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parentId: { type: integer }
+                TestCases:
+                  type: array
+                  items: { $ref: '#/components/schemas/TestPlanTestCase' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestPlanSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/testplan/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single test plan by Mongo _id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestPlanSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a test plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestPlanSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete a test plan
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/testplan/wildcardsearch:
+    get:
+      summary: 'Case-insensitive regex search over TestPlanId and objective (WP-F01, tenant-scoped)'
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: search
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TestPlan'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testexecution:
+    get:
+      summary: List test executions (tenant-scoped, WP-021b)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestExecutionList' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create a test execution (human/UI-driven run — source defaults to "ui")
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                TestPlanId: { type: string, description: TestPlan Mongo _id }
+                TestCases:
+                  type: array
+                  items: { $ref: '#/components/schemas/ExecutionTestCase' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestExecutionSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/testexecution/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single test execution by Mongo _id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestExecutionSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a test execution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestExecutionSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete a test execution
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/testexecution/getexecutiontc:
+    get:
+      summary: Enrich and return a TestCases[] entry's full detail from testRepoService (tenant-scoped, WP-021b)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200': { description: OK }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404':
+          description: No TestExecution matches this exeid in the caller's project (scope-mismatched or nonexistent — indistinguishable by design).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/testexecution/updateteststep:
+    put:
+      summary: Update a single test step's result within a TestCases[] subdocument (tenant-scoped, WP-021b)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: 'OK. `data.matchedCount`/`data.modifiedCount` are 0 if exeid does not resolve to a TestExecution in the caller''s project (scope-mismatched or nonexistent) — this route never 404s, it silently no-ops, same as its pre-WP-021b behavior.'
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/testexecution/updateattachment:
+    put:
+      summary: Update an attachment on a TestCases[] subdocument (tenant-scoped, WP-021b)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: 'OK. Same matchedCount/modifiedCount no-op-on-scope-mismatch behavior as updateteststep above.'
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/testexecution/wildcardsearch:
+    get:
+      summary: >-
+        Case-insensitive regex search over TestExecutionId only (WP-F01,
+        tenant-scoped) — assignedTo is a Keycloak subject UUID, not a name,
+        so it is deliberately NOT searched here, unlike the two-field
+        /api/v1/testplan/wildcardsearch above.
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: search
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TestExecution'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testexecution/ingest:
+    post:
+      summary: >
+        CI result ingestion (WP-033) — Cucumber JSON, JUnit XML, or a
+        normalized JSON payload. Tenant-scoped like every other route on
+        this service since WP-021b, but with its OWN auth path:
+        requireAuth('results:write') accepts EITHER an X-Api-Key
+        credential OR a Keycloak bearer, then requireProjectScope() +
+        authorize('write') run — for an API-key caller both are already
+        pre-satisfied by requireAuth() itself (the key's own bound
+        projectId, matched exactly against X-Project-Id). One ingest call
+        creates exactly ONE new TestExecution document (source:'ci'),
+        stamped with the VERIFIED projectId (the API key's bound project
+        for a key-authenticated call, or the caller's verified
+        req.projectScope for a human Keycloak bearer) — never appended
+        onto an existing run, and never trusting a `projectId` in the
+        request body. This endpoint accepts an `X-Api-Key`
+        in place of a Keycloak bearer token, so a CI job can post results
+        without a human identity. The key is validated and scoped to its
+        own project before anything is written.
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: X-Project-Id
+          in: header
+          required: true
+          description: Required, same as every route on this service. For an API-key caller this must match the key's bound projectId exactly.
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: 'Normalized single result, or {results: [...], ciRunUrl?, environment?}. Each result needs testCaseId (or tag) + status at minimum.'
+          application/xml:
+            schema: { type: string, description: JUnit XML report body (raw text). }
+          text/xml:
+            schema: { type: string }
+      responses:
+        '201':
+          description: Created. `data.projectId` is the API key's own bound project (or the human caller's verified scope), never a value taken from the request body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestExecutionSingle' }
+        '400':
+          description: Malformed report body, or one or more results failed field validation (including a projectId in the payload that disagrees with the verified X-Project-Id).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/IngestFieldError' }
+        '401':
+          description: No X-Api-Key AND no/invalid Keycloak bearer, rejected by requireAuth()'s keycloak.protect() fallback (this route's Kong config waves an anonymous request through — rejection happens at the SERVICE here, not at Kong, unlike every other route in this file).
+        '403':
+          description: X-Project-Id missing/non-integer/foreign, or (for an API key) bound to a different project than the header states.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }

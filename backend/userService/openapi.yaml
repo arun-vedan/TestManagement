@@ -1,0 +1,551 @@
+openapi: 3.0.3
+info:
+  title: userService
+  description: >
+    Identity: organizations, projects (+ membership/RBAC), and API keys.
+    WP-062, ADR-007 — hand-authored, not generated. Kong host: userservice.
+
+    **SPEC-VS-REALITY DISCREPANCY, flagged per WP-062's ground rules**:
+    this spec covers /api/v1/organizations, /api/v1/projects, and
+    /api/v1/apikeys — every route Kong actually exposes for this service.
+    backend/userService/routes/users.js also defines /api/v1/users/kcUsers
+    and /api/v1/users/directory. The legacy generic User CRUD that used to
+    live there (never Kong-routed, unreachable through the gateway) has
+    been retired. Documented here as GET /api/v1/users/kcUser only.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service. Note: userService's own routes are
+        NEVER project-scoped via X-Project-Id — that header is meaningless
+        here (this service IS the source of truth requireProjectScope()
+        calls out to; project identity comes from the :id path param or
+        req.projectScope.projectId as verified elsewhere, never a header
+        on THIS service's own routes).
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403NotMember:
+      description: 'Caller is not a member of this project (requireProjectAction — a local, in-process equivalent of service-core''s authorize(), since userService cannot call itself over HTTP to authorize its own requests). Exact message: "You are not a member of this project".'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound404:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadRequest400:
+      description: Validation error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    Organization:
+      type: object
+      properties:
+        _id: { type: string }
+        name: { type: string }
+        key: { type: string, description: 'Lowercase, unique, [a-z0-9-]+.' }
+        status: { type: string, enum: [active, archived] }
+        createdBy: { type: string, description: Keycloak sub. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, name, key]
+    Member:
+      type: object
+      properties:
+        userId: { type: string, description: Keycloak sub. }
+        role: { type: string, description: One of service-core's ROLES (permissions.js) — the single source of truth, not a locally forked enum. }
+        addedAt: { type: string, format: date-time }
+      required: [userId, role]
+    Project:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params. `id` is a separate legacy-compatible auto-incrementing Number (WP-020) — this is what every OTHER service''s X-Project-Id header value and projectId field refer to, NOT `_id`.'
+      properties:
+        _id: { type: string }
+        id: { type: integer, description: 'The numeric project id used everywhere else in this codebase as X-Project-Id / projectId.' }
+        name: { type: string }
+        key: { type: string }
+        organizationId: { type: string, description: Organization Mongo _id. }
+        status: { type: string, enum: [active, archived] }
+        createdBy: { type: string }
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/Member' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, id, name, key, organizationId]
+    ApiKeyPublic:
+      type: object
+      description: NEVER includes hashedSecret, and the plaintext secret is returned ONLY once, from POST /api/v1/apikeys.
+      properties:
+        keyId: { type: string, description: 'Format: "ak_" + 12 base64url chars. Public identifier, safe to log.' }
+        projectId: { type: integer }
+        scopes: { type: array, items: { type: string } }
+        name: { type: string }
+        createdBy: { type: string }
+        revoked: { type: boolean }
+        revokedAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+
+paths:
+  /api/v1/organizations:
+    get:
+      summary: List all organizations (unfiltered — no membership concept at the org level)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/Organization' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+    post:
+      summary: Create an organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, key]
+              properties:
+                name: { type: string }
+                key: { type: string }
+                status: { type: string, enum: [active, archived] }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Organization' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+  /api/v1/organizations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+        description: Organization Mongo _id.
+    get:
+      summary: Get a single organization
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Organization' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update an organization
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Organization' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete an organization
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/projects:
+    get:
+      summary: >
+        List all projects, OPTIONALLY filtered by ?organizationId=.
+        Deliberately NOT membership-filtered — requireProjectScope()
+        (WP-021, every other service) caches this exact response globally
+        to answer "is caller X a member of project Y"; filtering it here
+        would make that shared cache wrong for every other user.
+      parameters:
+        - name: organizationId
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/Project' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+    post:
+      summary: Create a project. Not membership-gated (no project exists yet to hold a role on) — the creator becomes the project's sole admin; client-supplied `members` in the body is ignored entirely (WP-022 privilege-escalation fix).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, key, organizationId]
+              properties:
+                name: { type: string }
+                key: { type: string }
+                organizationId: { type: string }
+                status: { type: string, enum: [active, archived] }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '404':
+          description: organizationId does not reference an existing organization.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/projects/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+        description: Project Mongo _id (NOT the numeric `id` field used elsewhere as X-Project-Id).
+    get:
+      summary: Get a single project (membership required — requireProjectAction('read'))
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a project's name/key/status (members are NOT editable here — dedicated member endpoints below; requireProjectAction('manage_project'))
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403':
+          description: Not a member, insufficient role, or the project is archived (read-only until restored).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Archive a project (requireProjectAction('manage_project')). Idempotent — archiving an already-archived project returns 200 with message "Project already archived", not an error.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { $ref: '#/components/schemas/Project' }
+                  message: { type: string, description: Present only on the already-archived idempotent path. }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/projects/{id}/members:
+    post:
+      summary: >
+        Add or update a project member (requireProjectAction('manage_members')).
+        Granting/holding 'admin' requires the ACTOR to already be an
+        admin (WP-022 escalation guard) — except on a zero-member
+        ("ownerless") project, where any authenticated caller may claim
+        manage_members, same trust level as creating a new project. The
+        target userId must be a real Keycloak user (verified via the
+        Keycloak Admin API) before it is stored.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, role]
+              properties: { userId: { type: string }, role: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '400':
+          description: 'Missing/invalid userId or role, or userId does not reference a real Keycloak user.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403':
+          description: 'Not a member with manage_members, or (granting/changing admin) actor is not already an admin.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/projects/{id}/members/{userId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: userId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Keycloak sub of the target member.
+    put:
+      summary: Update a member's role (requireProjectAction('manage_members'), admin-escalation guard same as POST .../members)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties: { role: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+        '404':
+          description: Project not found, or that userId is not a member of it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    delete:
+      summary: >
+        Remove a member (requireProjectAction('manage_members')). Removing
+        an admin requires the actor to already be an admin. Deliberately
+        allows removing the LAST remaining admin (a legitimate operation,
+        not guarded against — see the spec's own note; WP-021's isolation
+        tests rely on this to revoke their own fixture identity).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { $ref: '#/components/schemas/Project' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403':
+          description: 'Not a member with manage_members, or (removing an admin) actor is not already an admin.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Project not found, or that userId is not a member of it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/apikeys:
+    post:
+      summary: >
+        Create an API key scoped to the caller's CURRENT X-Project-Id
+        project (Keycloak human bearer only — this route uses
+        keycloak.protect(), never requireAuth(), so an API key can never
+        mint another API key). requireProjectScope() + authorize
+        ('manage_project') — admin-only, same bar as archiving a project.
+        The plaintext secret is returned in THIS response ONLY and is
+        never retrievable again (bcrypt-hashed at rest, never logged).
+      parameters:
+        - name: X-Project-Id
+          in: header
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes]
+              properties:
+                scopes: { type: array, items: { type: string }, description: 'Must be non-empty; each scope validated against ALLOWED_SCOPES.' }
+                name: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, warning]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/ApiKeyPublic'
+                      - type: object
+                        properties:
+                          secret:
+                            type: string
+                            description: 'Plaintext, 64 hex chars. SHOWN EXACTLY ONCE — this field never appears in any other response.'
+                  warning: { type: string, description: '"This secret will not be shown again. Store it now; it cannot be retrieved later."' }
+        '400':
+          description: scopes missing/empty, or contains an unknown scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+    get:
+      summary: List API keys for the caller's current project. Never includes hashedSecret or the plaintext secret.
+      parameters:
+        - name: X-Project-Id
+          in: header
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/ApiKeyPublic' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+  /api/v1/apikeys/{keyId}:
+    delete:
+      summary: Revoke an API key. Scoped to the caller's project (a key belonging to a different project is indistinguishable from nonexistent — 404, never leaking its existence). Revocation is immediate (live, uncached check on every use).
+      parameters:
+        - name: keyId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: X-Project-Id
+          in: header
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: object, properties: { keyId: { type: string }, revoked: { type: boolean, enum: [true] }, revokedAt: { type: string, format: date-time } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403NotMember' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/apikeys/verify:
+    post:
+      summary: >
+        INTERNAL, service-to-service only. Called by other services'
+        requireAuth() middleware to validate an API key; not intended for
+        a browser or end user. An unknown or incorrect (keyId, secret)
+        pair always returns the same generic {valid:false}; no information
+        about which half was wrong, or whether the keyId exists at all.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keyId, secret]
+              properties: { keyId: { type: string }, secret: { type: string } }
+      responses:
+        '200':
+          description: Always 200 — validity is communicated in the body, not the status code.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties: { valid: { type: boolean, enum: [false] } }
+                  - type: object
+                    required: [valid, keyId, projectId, scopes]
+                    properties:
+                      valid: { type: boolean, enum: [true] }
+                      keyId: { type: string }
+                      projectId: { type: integer }
+                      scopes: { type: array, items: { type: string } }
+  /api/v1/users/kcUser:
+    get:
+      summary: >
+        Proxy to Keycloak's own userinfo for the caller's token — the ONLY
+        path under /api/v1/users Kong actually exposes (see this spec's
+        top-level discrepancy note; the rest of routes/users.js has no
+        Kong route).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, description: Keycloak userinfo response, passed through. }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }

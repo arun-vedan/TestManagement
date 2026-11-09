@@ -1,0 +1,61 @@
+/* vedan login theme.
+ *
+ * Tokens mirror frontend/src/Theme/tokens.ts so the login screen and the
+ * workbench read as one product. #084C32 (Deep Forest) is the brand anchor
+ * and must not drift from the app's palette.primary.
+ */
+:root {
+  --sk-brand: #084C32;
+  --sk-brand-deep: #05331F;
+  --sk-brand-tint: #EEF5F1;
+  --sk-ink: #1c2126;
+  --sk-muted: #6b757f;
+  --sk-line: #dfe2e6;
+  --sk-surface: #ffffff;
+}
+
+.sk-shell { min-height: 100vh; background: var(--sk-brand); }
+
+.sk-split {
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.sk-panel-brand {
+  background: var(--sk-brand-tint);
+  color: var(--sk-ink);
+  padding: 44px 40px;
+}
+.sk-panel-brand h1 { font-size: 22px; line-height: 1.3; margin: 20px 0 8px; font-weight: 700; color: var(--sk-brand); letter-spacing: 0.02em; text-transform: uppercase; }
+.sk-panel-brand p  { font-size: 14px; line-height: 1.6; margin: 0; color: #454d55; max-width: 34ch; }
+.sk-illus { width: 100%; max-width: 420px; margin-top: 28px; display: block; }
+
+.sk-panel-form { background: var(--sk-surface); padding: 44px 40px; }
+
+.sk-panel-form .q-field--filled .q-field__control { background: #f7f8f9; border: 1px solid var(--sk-line); border-radius: 8px; }
+.sk-panel-form .q-field--filled .q-field__control:before,
+.sk-panel-form .q-field--filled .q-field__control:after { display: none; }
+.sk-panel-form .q-field--focused .q-field__control { border-color: var(--sk-brand); box-shadow: 0 0 0 3px rgba(8, 76, 50, 0.16); }
+
+.sk-panel-form #login { background: var(--sk-brand) !important; color: #ffffff !important; width: 100%; border-radius: 8px; padding: 10px 0; font-weight: 600; }
+.sk-panel-form #login:hover { background: var(--sk-brand-deep) !important; }
+
+.sk-form-title { font-size: 18px; font-weight: 600; color: var(--sk-ink); margin-bottom: 4px; }
+.sk-form-sub   { font-size: 13px; color: var(--sk-muted); margin-bottom: 20px; }
+
+@media (max-width: 900px) {
+  .sk-split { max-width: 460px; }
+  .sk-panel-brand { padding: 28px 28px 8px; text-align: center; }
+  .sk-panel-brand p { margin: 0 auto; }
+  .sk-illus { max-width: 220px; margin: 16px auto 0; }
+  .sk-panel-form { padding: 28px; }
+}
+
+/* The logo was sized at 30% of its container, which in the wide brand panel
+ * rendered it ~20px tall and unreadable. Size it explicitly instead. */
+.sk-logo img { height: 40px; width: auto; display: block; }
+@media (max-width: 900px) { .sk-logo img { height: 32px; margin: 0 auto; } }

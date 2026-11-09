@@ -1,0 +1,9 @@
+{
+  "name": "@srckube/wp021-migration-scripts",
+  "version": "0.1.0",
+  "description": "WP-021 host-run, dry-run-first data migration script(s). Not installed into any service's Docker image (see backfillProjectId.js's REPRODUCIBILITY NOTE).",
+  "private": true,
+  "dependencies": {
+    "mongoose": "^5.7.1"
+  }
+}

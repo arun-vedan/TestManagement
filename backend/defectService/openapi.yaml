@@ -1,0 +1,369 @@
+openapi: 3.0.3
+info:
+  title: defectService
+  description: >
+    Defect tracking (WP-062, ADR-007 — hand-authored, not generated).
+    Mounted at /api/v1/defects behind Kong (srckube-kong/kong.yml, host:
+    defectservice). Covers every route in
+    backend/defectService/routes/defects.js as of this WP. Two notable
+    departures from testRepoService/requirementService's shape, both
+    verified against the real controller (backend/defectService/
+    controllers/defects.js):
+      1. Status transitions are validated against istatusservice's LIVE,
+         dynamic status graph (GET /api/v1/issuestatus), not a fixed
+         LIFECYCLE_STATUSES enum — see the /status path's description.
+      2. Bulk operations support ONLY action=assign, not action=status
+         (bulkUpdateDefects rejects action=status with 400 — bulk
+         status-change is explicitly not implemented for defects).
+    See EXECUTION_LOG.md's WP-062 entry for verification notes.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: >
+        Numeric project id (WP-021). Required on every route below.
+        Missing/non-integer/foreign-project/non-member all return 403, not
+        400 (service-core/middleware/projectScope.js).
+      schema:
+        type: integer
+    DefectId:
+      name: id
+      in: path
+      required: true
+      description: The document's Mongo _id — not the human-readable defectId (e.g. "Bug-1").
+      schema:
+        type: string
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403:
+      description: Direct-to-service auth rejection, or a WP-021 X-Project-Id problem (missing/non-integer/unknown/non-member).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound404:
+      description: Resource not found (or belongs to a different project — indistinguishable by design, WP-021).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadRequest400:
+      description: Validation error, or a list-route filter value that could not be cast to its field's schema type (WP-013b).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    StatusHistoryEntry:
+      type: object
+      properties:
+        from: { type: string }
+        to: { type: string }
+        changedBy: { type: string }
+        changedAt: { type: string, format: date-time }
+        correlationId: { type: string }
+    Defect:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params. WP-024 audit entityId holds `defectId` (the business id, e.g. "Bug-1"), not `_id`.'
+      properties:
+        _id: { type: string }
+        id: { type: integer, description: Numeric sequence value (WP-020c atomic counters). }
+        defectId: { type: string, description: 'Human-readable business id, e.g. "Bug-1".' }
+        projectId: { type: integer, description: WP-021 tenant scope, stamped server-side from the verified X-Project-Id header. }
+        summary: { type: string }
+        Priority: { type: string }
+        Severity: { type: string }
+        description: { type: string }
+        Status:
+          type: string
+          description: >
+            Free-text at the schema level (no enum) — the actual valid
+            vocabulary and its transition graph live in istatusservice
+            (GET /api/v1/issuestatus), fetched live by PUT /:id/status.
+        assignedTo: { type: string }
+        attachment:
+          type: array
+          items: { type: object }
+        statusHistory:
+          type: array
+          description: Append-only transition log, populated ONLY by PUT /:id/status — never by the generic PUT /:id.
+          items: { $ref: '#/components/schemas/StatusHistoryEntry' }
+        createdBy: { type: string }
+        updatedBy: { type: string }
+        dynamicFields: { type: object }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, defectId, projectId]
+    Pagination:
+      type: object
+      properties:
+        next: { type: object, properties: { page: { type: integer }, limit: { type: integer } } }
+        prev: { type: object, properties: { page: { type: integer }, limit: { type: integer } } }
+    DefectList:
+      type: object
+      description: shared advancedResults() envelope — see service-core/middleware/advancedResults.js.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Defect' }
+    DefectSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/Defect' }
+
+paths:
+  /api/v1/defects:
+    get:
+      summary: List defects (tenant-scoped, paginated, filterable)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefectList' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create a defect
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                summary: { type: string }
+                description: { type: string }
+                Priority: { type: string }
+                Severity: { type: string }
+                Status: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefectSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/defects/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DefectId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single defect by Mongo _id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefectSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a defect (unconstrained — including Status free-text, unlike /status below)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Partial Defect. projectId is stripped server-side even if present.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefectSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete a defect
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/defects/{id}/status:
+    parameters:
+      - $ref: '#/components/parameters/DefectId'
+      - $ref: '#/components/parameters/XProjectId'
+    put:
+      summary: >
+        Transition status, validated against istatusservice's LIVE status
+        graph (GET http://istatusservice:3000/api/v1/issuestatus) — NOT a
+        fixed enum, unlike testRepoService/requirementService's
+        LIFECYCLE_STATUSES. A defect whose current Status doesn't match any
+        known istatusservice vocabulary entry (legacy free-text data) fails
+        closed with 400, directing the caller to the unconstrained PUT
+        /:id instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, description: 'Accepts either "status" or "Status" in the body.' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefectSingle' }
+        '400':
+          description: Missing status, unrecognized target status name, current status not part of the recognized workflow, or an illegal transition per istatusservice's graph.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '503':
+          description: istatusservice is unreachable, or ISTATUS_SERVICE is not configured — fails closed, never guesses at transition validity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/defects/wildcardsearch:
+    get:
+      summary: Case-insensitive regex search
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: search
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Defect' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/defects/bulk:
+    patch:
+      summary: >
+        Bulk assign, all-or-nothing (WP-043). action=assign ONLY — unlike
+        testRepoService's /bulk, action=status is rejected with 400 (bulk
+        status-change is explicitly not supported for defects, since a
+        real transition must go through istatusservice's graph one at a
+        time via PUT /:id/status).
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, action, assignedTo]
+              properties:
+                ids: { type: array, items: { type: string }, description: Mongo _ids, max 500. }
+                action: { type: string, enum: [assign] }
+                assignedTo: { type: string }
+      responses:
+        '200':
+          description: All items updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  policy: { type: string, enum: [all-or-nothing] }
+                  updated: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Defect' }
+        '400':
+          description: 'action other than "assign", or missing assignedTo.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '422':
+          description: One or more ids not found in this project — nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    delete:
+      summary: Bulk delete, all-or-nothing (WP-043)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, items: { type: string } }
+      responses:
+        '200':
+          description: All items deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  policy: { type: string, enum: [all-or-nothing] }
+                  deleted: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '422':
+          description: One or more ids not found in this project — nothing was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }

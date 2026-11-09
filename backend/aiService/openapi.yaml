@@ -1,0 +1,645 @@
+openapi: 3.0.3
+info:
+  title: aiService
+  description: >
+    Provider-agnostic AI foundation (WP-050..053). WP-062, ADR-007 —
+    hand-authored, not generated. Mounted at /api/v1/ai behind Kong
+    (srckube-kong/kong.yml, host: aiservice). Covers every route in
+    backend/aiService/routes/ai.js.
+
+    GR-8 (this service's own operating rule, enforced in code, not just
+    docs): aiService **never writes to another service's domain data**.
+    Every generation/analysis endpoint returns `advisory: true,
+    draftOnly: true` in its response and persists nothing outside its own
+    database (AiInteraction logs, AiProjectSettings, DismissedDuplicate).
+    The one exception that DOES write cross-service is
+    apply-lint-finding, and even that goes through requirementService's
+    own governed update API — never a direct database write from here.
+
+    THREE DISTINCT FAILURE MODES on nearly every route, all documented
+    per-operation below because their status codes are easy to conflate:
+      1. Not a project member / role can't 'read' -> 403 (service-core's
+         requireProjectScope()/authorize()).
+      2. AI feature disabled for this project -> 403, textually distinct
+         message (checkProjectEnabled middleware).
+      3. Underlying provider unavailable -> 503 "AI is currently
+         unavailable; please try again later" — NEVER a fabricated/empty
+         success response (this codebase's fail-closed stance for
+         advisory AI content, same class of decision as
+         requireProjectScope()'s and defectService's dependency-outage
+         handling elsewhere).
+    A fourth, unrelated to the three above: the per-user daily quota ->
+    429 (lib/rateLimiter.js), checked ONCE per logical feature invocation
+    (audit-duplicates, which may make many provider calls under the hood,
+    still only spends one quota unit).
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: Numeric project id (WP-021, scoped from birth — WP-050). Missing/non-integer/foreign/non-member all return 403, not 400.
+      schema: { type: integer }
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403Scope:
+      description: Not a project member, or role lacks the RBAC action required (service-core authorize()) — distinct message from the "AI disabled" 403 below.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden403Disabled:
+      description: 'The AI feature is disabled for this project (checkProjectEnabled) — exact message: "AI feature is disabled for this project".'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited429:
+      description: 'Per-user daily AI usage quota exceeded (lib/rateLimiter.js). Message: "AI daily rate limit exceeded (<limit> requests/day)".'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ProviderUnavailable503:
+      description: 'The underlying AI provider failed/errored. Fails closed — never a fabricated or empty success. Message: "AI is currently unavailable; please try again later".'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadRequest400:
+      description: Missing/invalid required field(s) in the request body.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound404:
+      description: The referenced requirement/entity was not found in its owning service.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadGateway502:
+      description: The owning service (requirementService/testRepoService/reportingService) was unreachable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    AdvisoryEnvelope:
+      type: object
+      description: >
+        Common shape across every generation/analysis route — NOT the
+        codebase's plain {success, data} shape: `advisory` and
+        `draftOnly` are always present and always true, signaling GR-8
+        (nothing here was written to a domain entity).
+      required: [success, advisory, draftOnly, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        advisory: { type: boolean, enum: [true] }
+        draftOnly: { type: boolean, enum: [true] }
+        data: { type: object }
+    UsageInfo:
+      type: object
+      properties:
+        inputTokens: { type: integer }
+        outputTokens: { type: integer }
+    TestCaseCandidate:
+      type: object
+      properties:
+        TestCaseSummary: { type: string }
+        TestCaseDescription: { type: string }
+        TestSteps:
+          type: array
+          items:
+            type: object
+            properties: { testStep: { type: string }, Expected: { type: string } }
+    DuplicateCandidateResult:
+      type: object
+      properties:
+        testCaseId: { type: string, description: business TestCaseId (e.g. "TC-5"), never _id. }
+        TestCaseSummary: { type: string }
+        score: { type: integer, description: 0-100. }
+        reason: { type: string }
+    LintFinding:
+      type: object
+      properties:
+        excerpt: { type: string }
+        issue: { type: string }
+        suggestedRewrite: { type: string }
+    AiInteraction:
+      type: object
+      properties:
+        _id: { type: string }
+        userId: { type: string }
+        projectId: { type: integer }
+        feature: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        promptPreview: { type: string }
+        promptHash: { type: string }
+        latencyMs: { type: integer }
+        status: { type: string }
+        correlationId: { type: string }
+        createdAt: { type: string, format: date-time }
+
+paths:
+  /api/v1/ai/health:
+    get:
+      summary: Round-trip provider health check. NOT subject to the daily rate limit (diagnostic, not feature usage).
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: object
+                    properties: { provider: { type: string }, model: { type: string }, echo: { type: string }, latencyMs: { type: integer } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/complete:
+    post:
+      summary: General-purpose text completion — the foundation endpoint WP-051..053 build on.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                system: { type: string }
+                messages:
+                  type: array
+                  items: { type: object, properties: { role: { type: string }, content: { type: string } } }
+                maxTokens: { type: integer }
+                temperature: { type: number }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AdvisoryEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/structured:
+    post:
+      summary: Schema-guided structured-output completion — same gating as /complete.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages, schema]
+              properties:
+                system: { type: string }
+                messages: { type: array, items: { type: object } }
+                schema: { type: object, description: JSON-schema-shaped output contract. }
+                maxTokens: { type: integer }
+                temperature: { type: number }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AdvisoryEnvelope' } } } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/generate-testcases:
+    post:
+      summary: >
+        Draft test-case candidates from a requirement. NEVER PERSISTS —
+        read-only against requirementService (fetch) + testRepoService
+        (style exemplars only). Acceptance is a separate call the
+        frontend makes directly against testRepoService/linkIssueService.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requirementId]
+              properties:
+                requirementId: { type: string, description: requirementService's Mongo _id (not reqId). }
+                count: { type: integer }
+                style: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AdvisoryEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          requirementId: { type: string }
+                          reqId: { type: string }
+                          candidates:
+                            type: array
+                            items: { $ref: '#/components/schemas/TestCaseCandidate' }
+                          generatedBy: { type: string, enum: [ai] }
+                          meta:
+                            type: object
+                            properties:
+                              requestedCount: { type: integer }
+                              receivedCount: { type: integer }
+                              droppedCandidates: { type: integer }
+                              truncatedCount: { type: integer }
+                              exemplarCount: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/interactions:
+    get:
+      summary: List recent AI interactions for this project (cost/audit view)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/AiInteraction' } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+  /api/v1/ai/check-duplicate-testcase:
+    post:
+      summary: Compare one (possibly unsaved) test case against same-module candidates for likely duplication.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [TestCaseSummary]
+              properties:
+                testCaseId: { type: string, description: business TestCaseId; omit for an unsaved draft. }
+                TestCaseSummary: { type: string }
+                TestCaseDescription: { type: string }
+                parentId: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AdvisoryEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          candidates: { type: array, items: { $ref: '#/components/schemas/DuplicateCandidateResult' } }
+                          threshold: { type: integer }
+                          scannedCount: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/audit-duplicates:
+    post:
+      summary: >
+        Bulk near-duplicate audit across a project (optionally scoped by
+        parentId). One quota unit for the whole audit even though it may
+        issue many provider calls. Fails closed (503) only when EVERY
+        attempted comparison failed — a partial failure still returns 200
+        with failedComparisonCount > 0, so a caller can tell "some
+        comparisons didn't run" from "audit found nothing to flag".
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parentId: { type: integer, description: Optional module/folder filter. }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AdvisoryEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [pairs, threshold, scannedCount, moduleGroupCount, skippedGroupCount, providerCallCount, failedComparisonCount]
+                        properties:
+                          pairs:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                aId: { type: string }
+                                aSummary: { type: string }
+                                bId: { type: string }
+                                bSummary: { type: string }
+                                score: { type: integer }
+                                reason: { type: string }
+                          threshold: { type: integer }
+                          scannedCount: { type: integer }
+                          moduleGroupCount: { type: integer }
+                          skippedGroupCount: { type: integer, description: Module groups skipped for exceeding AUDIT_MAX_GROUP_SIZE. }
+                          providerCallCount: { type: integer }
+                          failedComparisonCount:
+                            type: integer
+                            description: >
+                              WP-052's own richer-than-usual field: visible
+                              even on a 200. A non-zero value means this
+                              audit is PARTIAL — some comparisons could not
+                              be completed and are NOT a confirmed
+                              all-clear, distinct from a 503 (which only
+                              fires when ALL attempted comparisons failed).
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+        '503':
+          description: Every attempted comparison failed (not just some) — fails closed rather than returning a false all-clear with an empty pairs[].
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/ai/dismiss-duplicate:
+    post:
+      summary: Persist a "not a duplicate" dismissal for one pair of test cases. WRITE action (unlike check/audit above), but only to aiService's own database.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [aId, bId]
+              properties: { aId: { type: string }, bId: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: object, properties: { pairKey: { type: string }, dismissed: { type: boolean, enum: [true] } } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+    delete:
+      summary: Undo a "not a duplicate" dismissal.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [aId, bId]
+              properties: { aId: { type: string }, bId: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: object, properties: { pairKey: { type: string }, dismissed: { type: boolean, enum: [false] } } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+  /api/v1/ai/lint-requirement:
+    post:
+      summary: Ambiguity/quality linting on a requirement — runs in ANY lifecycle status, never writes.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requirementId]
+              properties:
+                requirementId: { type: string, description: requirementService's Mongo _id (not reqId). }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AdvisoryEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          requirementId: { type: string }
+                          reqId: { type: string }
+                          status: { type: string }
+                          findings: { type: array, items: { $ref: '#/components/schemas/LintFinding' } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/apply-lint-finding:
+    post:
+      summary: >
+        Apply one AI-suggested rewrite to a requirement's description, via
+        requirementService's OWN update API (never a direct write from
+        aiService) — RequirementVersion snapshots, tenant scoping, RBAC,
+        and WP-024 audit all stay intact. Lifecycle-gated: draft/review
+        only (409 otherwise). Also 409 if the excerpt no longer matches
+        the requirement's current text (stale suggestion).
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requirementId, excerpt, suggestedRewrite]
+              properties:
+                requirementId: { type: string }
+                excerpt: { type: string }
+                suggestedRewrite: { type: string }
+      responses:
+        '200':
+          description: OK — advisory:true but NOT draftOnly (this one DOES persist, via requirementService).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  advisory: { type: boolean, enum: [true] }
+                  data: { type: object, description: The updated Requirement, as returned by requirementService. }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '409':
+          description: Requirement is not in draft/review, or the excerpt no longer matches the current description text.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+  /api/v1/ai/summarize-report:
+    post:
+      summary: >
+        Executive-summary narrative over reportingService's own aggregates,
+        with a grounding post-check (WP-053) — every numeric figure in the
+        generated markdown must trace back to a real number in the
+        fetched aggregates; a violation is flagged INLINE in the markdown
+        (never silently dropped) AND reported structurally in
+        `data.grounding`.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope]
+              properties:
+                scope: { type: string, description: 'e.g. "project", "release", "plan".' }
+                releaseId: { type: string }
+                planId: { type: string }
+                days: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/AdvisoryEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [scope, markdown, grounding]
+                        properties:
+                          scope: { type: string }
+                          releaseId: { type: string }
+                          planId: { type: string }
+                          days: { type: integer }
+                          markdown: { type: string, description: 'Ungrounded figures are marked inline, e.g. **[UNVERIFIED FIGURE: ...]**.' }
+                          generatedBy: { type: string, enum: [ai] }
+                          generatedAt: { type: string, format: date-time }
+                          stale: { type: boolean, description: Whether any underlying reportingService aggregate was stale (WP-040's own stale flag, passed through). }
+                          staleReports: { type: array, items: { type: string } }
+                          sourceReports: { type: array, items: { type: string } }
+                          grounding:
+                            type: object
+                            description: WP-053's own richer-than-usual field — structural grounding result, not just the inline markdown markers.
+                            required: [grounded, citedCount, groundedCount, ungroundedFigures, rule]
+                            properties:
+                              grounded: { type: boolean }
+                              citedCount: { type: integer }
+                              groundedCount: { type: integer }
+                              ungroundedFigures:
+                                type: array
+                                items: { type: object, properties: { raw: { type: string }, kind: { type: string } } }
+                              rule: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '429': { $ref: '#/components/responses/RateLimited429' }
+        '502': { $ref: '#/components/responses/BadGateway502' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable503' }
+  /api/v1/ai/settings:
+    get:
+      summary: 'Read this project''s AI feature-flag state. Readable by anyone who can read the project (opt-out model — no document means enabled:true).'
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: object, properties: { projectId: { type: integer }, enabled: { type: boolean } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403Scope' }
+    put:
+      summary: Enable/disable the AI feature for this project. Gated on manage_project (same level as project rename/archive), NOT checkProjectEnabled itself — an admin can always flip the flag even while it's off.
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties: { enabled: { type: boolean } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: object, properties: { projectId: { type: integer }, enabled: { type: boolean } } }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403':
+          description: Not a project member, insufficient role (must be manage_project-capable), or (GET only) AI disabled for this project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }

@@ -1,0 +1,373 @@
+openapi: 3.0.3
+info:
+  title: releaseService
+  description: >
+    Releases + environments (WP-025). WP-062, ADR-007 — hand-authored, not
+    generated. Two routers on one service: /api/v1/releases
+    (backend/releaseService/routes/releases.js) and /api/v1/environments
+    (backend/releaseService/routes/environments.js). Kong host:
+    releaseservice.
+
+    **SPEC-VS-REALITY NOTE**: unlike testRepoService/requirementService/
+    defectService, this service's routes do NOT mount authorize()
+    (WP-022 RBAC) — verified by reading both route files: only
+    keycloak.protect() + requireProjectScope(), no `authorize(...)` call
+    anywhere. Every authenticated project member can write here
+    regardless of role (viewer included) — routes/releases.js's own
+    comment documents this as a known, deliberate gap ("out of this WP's
+    scope... every route already has a single, consistent insertion point
+    where authorize(...) can be added later"), not an oversight this spec
+    should paper over.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: Numeric project id (WP-021/WP-025, scoped from birth). Missing/non-integer/foreign/non-member all return 403, not 400.
+      schema: { type: integer }
+    ReleaseId:
+      name: id
+      in: path
+      required: true
+      description: The Release document's Mongo _id — not the human-readable releaseId (e.g. "REL-1").
+      schema: { type: string }
+    EnvironmentId:
+      name: id
+      in: path
+      required: true
+      description: The Environment document's Mongo _id.
+      schema: { type: string }
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403:
+      description: Direct-to-service auth rejection, or a WP-021 X-Project-Id problem.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound404:
+      description: Resource not found (or belongs to a different project).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    QualityGate:
+      type: object
+      required: [type, threshold]
+      properties:
+        type: { type: string, enum: [minPassRate, maxOpenDefects] }
+        threshold:
+          type: number
+          description: 'minPassRate: a 0-100 percentage. maxOpenDefects: a max count.'
+        severity:
+          type: string
+          description: maxOpenDefects only — optional Severity filter (free-text, matches defectService's own unenforced field).
+    Release:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params. WP-024 audit entityId (if this service emits any) would hold `releaseId`, not `_id`.'
+      properties:
+        _id: { type: string }
+        id: { type: integer }
+        releaseId: { type: string, description: 'Human-readable business id, e.g. "REL-1".' }
+        name: { type: string }
+        projectId: { type: integer }
+        targetDate: { type: string, format: date-time }
+        status: { type: string, enum: [planned, in-progress, frozen, released, cancelled] }
+        linkedTestPlanIds:
+          type: array
+          items: { type: string }
+          description: testPlanExecutionService TestPlan Mongo _id strings — reference by id only, no FK/populate.
+        notes: { type: string }
+        qualityGates:
+          type: array
+          items: { $ref: '#/components/schemas/QualityGate' }
+        createdBy: { type: string }
+        updatedBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, releaseId, name, projectId]
+    ReleaseList:
+      type: object
+      description: shared advancedResults() envelope.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination: { type: object }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Release' }
+    ReleaseSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/Release' }
+    GateRuleResult:
+      type: object
+      properties:
+        type: { type: string, enum: [minPassRate, maxOpenDefects] }
+        threshold: { type: number }
+        severity: { type: string, nullable: true }
+        actual: { type: number }
+        passed: { type: boolean }
+        details:
+          type: object
+          description: 'minPassRate: {totalTestCases, passedTestCases, note?}. maxOpenDefects: {openDefectIds: string[]}.'
+    GateStatusResponse:
+      type: object
+      description: >
+        NOT the shared {success, data:<entity>} shape for a plain entity —
+        `data` here is a computed evaluation result, live every call (no
+        cache — contrast with reportingService's cached read model).
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          type: object
+          required: [releaseId, status, overall, passed, rules]
+          properties:
+            releaseId: { type: string }
+            status: { type: string }
+            overall: { type: string, enum: [green, red] }
+            passed: { type: boolean }
+            rules:
+              type: array
+              items: { $ref: '#/components/schemas/GateRuleResult' }
+    Environment:
+      type: object
+      properties:
+        _id: { type: string }
+        id: { type: integer }
+        name: { type: string }
+        projectId: { type: integer }
+        description: { type: string }
+        url: { type: string }
+        createdBy: { type: string }
+        updatedBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, name, projectId]
+    EnvironmentList:
+      type: object
+      description: shared advancedResults() envelope.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination: { type: object }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Environment' }
+    EnvironmentSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/Environment' }
+
+paths:
+  /api/v1/releases:
+    get:
+      summary: List releases (tenant-scoped, paginated, filterable)
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseList' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create a release (no RBAC gating — any project member, including viewer, per this service's spec-vs-reality note above)
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                targetDate: { type: string, format: date-time }
+                notes: { type: string }
+                qualityGates:
+                  type: array
+                  items: { $ref: '#/components/schemas/QualityGate' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/releases/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ReleaseId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single release
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a release
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete a release
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/releases/{id}/gate-status:
+    get:
+      summary: >
+        Evaluate this release's quality gates against LIVE data — no
+        cache, recomputed every call. Fails closed with 503 if a
+        dependency the release's configured rules actually need
+        (testPlanExecutionService for minPassRate, defectService +
+        istatusservice for maxOpenDefects) is unreachable; a dependency
+        NOT used by this release's rules is never contacted.
+      parameters:
+        - $ref: '#/components/parameters/ReleaseId'
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/GateStatusResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+        '503':
+          description: A dependency needed by one of this release's configured gate rules is not configured or unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/releases/{id}/plans:
+    post:
+      summary: Link a test plan to this release
+      parameters:
+        - $ref: '#/components/parameters/ReleaseId'
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [testPlanId]
+              properties:
+                testPlanId: { type: string, description: testPlanExecutionService TestPlan Mongo _id. }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/releases/{id}/plans/{testPlanId}:
+    delete:
+      summary: Unlink a test plan from this release
+      parameters:
+        - $ref: '#/components/parameters/ReleaseId'
+        - $ref: '#/components/parameters/XProjectId'
+        - name: testPlanId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/environments:
+    get:
+      summary: List environments (tenant-scoped, paginated, filterable)
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/EnvironmentList' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create an environment
+      parameters: [{ $ref: '#/components/parameters/XProjectId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                url: { type: string }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/EnvironmentSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/environments/{id}:
+    parameters:
+      - $ref: '#/components/parameters/EnvironmentId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single environment
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/EnvironmentSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update an environment
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/EnvironmentSingle' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete an environment
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }

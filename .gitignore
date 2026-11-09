@@ -1,0 +1,9 @@
+.env.test
+backend/.env
+
+# WP-064: mongodump output. Real data (may include customer-like content);
+# never commit it.
+/backups/
+
+# superpowers SDD scratch workspaces (ledgers, briefs, review packages)
+.superpowers/

@@ -1,0 +1,12 @@
+{
+  "name": "@srckube/test-utils",
+  "version": "0.1.0",
+  "description": "Test-only helpers shared across backend service test suites (Sprint 2.2) — not a runtime dependency, not part of any Docker image.",
+  "main": "getServiceToken.js",
+  "private": true,
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "js-yaml": "3.15.1"
+  }
+}

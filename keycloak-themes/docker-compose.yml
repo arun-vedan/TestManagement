@@ -1,0 +1,84 @@
+version: '3'
+
+services:
+  postgres:
+      # Pinned deliberately. Both images were previously untagged, so they
+      # resolved to :latest at pull time -- the stack was only on these
+      # versions because the containers happened to be created when they
+      # were. Any `docker compose pull`, or a fresh machine, would silently
+      # have crossed a major version. Same discipline WP-016 enforced for npm
+      # dependencies, which the infra layer never adopted.
+      image: postgres:18
+      container_name: postgres
+      # postgres:18's official image changed its volume convention: it now
+      # expects a single mount at /var/lib/postgresql (not .../data) and
+      # manages a versioned subdirectory itself (pg_ctlcluster-style
+      # layout; see https://github.com/docker-library/postgres/pull/1259).
+      # Mounting at .../data as before makes the 18 entrypoint refuse to
+      # start even against a brand-new, empty volume.
+      volumes:
+        - keycloack-themes-postgres-pg18:/var/lib/postgresql
+      environment:
+        POSTGRES_DB: keycloak
+        POSTGRES_USER: keycloak
+        POSTGRES_PASSWORD: password
+      networks:
+        - src-kube-network  
+  keycloak:
+      # Keycloak 26 config migration (Step 4 of the upgrade plan).
+      #
+      # Keycloak fails to start on an UNKNOWN option, so a tag bump alone
+      # cannot boot -- several options below were removed in 26. Mapping
+      # verified against keycloak.org/server/all-config, not recalled:
+      #   KEYCLOAK_ADMIN[_PASSWORD] -> KC_BOOTSTRAP_ADMIN_USERNAME/_PASSWORD
+      #   KC_PROXY: edge            -> removed; KC_PROXY_HEADERS
+      #   KC_HOSTNAME_URL           -> not valid under hostname v2
+      #   KC_HOSTNAME_STRICT_HTTPS  -> not valid under hostname v2
+      #   KEYCLOAK_FRONTEND_URL     -> legacy, removed
+      #
+      # The hostname settings are dropped rather than translated. They
+      # declared https://srckube.com:3443 while every client in this stack
+      # actually talks to localhost:8080, and `start-dev` relaxes hostname
+      # strictness anyway -- so they were inert. Porting an inert setting
+      # forward under a stricter v2 parser invites a boot failure for no
+      # benefit. If this is ever fronted by a real proxy, set KC_HOSTNAME
+      # (full URL) and KC_PROXY_HEADERS together, deliberately.
+      #
+      # KC_BOOTSTRAP_ADMIN_* only creates a TEMPORARY admin on a first boot
+      # against an empty database. The real `admin` already exists in the
+      # master realm in Postgres and survives the upgrade; these are kept
+      # so a from-scratch bring-up still works.
+      image: quay.io/keycloak/keycloak:26.7.3
+      container_name: keycloak
+      command: start-dev --spi-theme-static-max-age=-1 --spi-theme-cache-themes=false --spi-theme-cache-templates=false --verbose
+      environment:
+        KC_DB: postgres
+        KC_DB_URL_HOST: postgres
+        KC_DB_USERNAME: keycloak
+        KC_DB_PASSWORD: password
+        KC_DB_SCHEMA: public
+        KC_BOOTSTRAP_ADMIN_USERNAME: admin
+        KC_BOOTSTRAP_ADMIN_PASSWORD: Pass;word1
+      volumes:
+        - ./themes/kdk:/opt/keycloak/themes/kdk      
+        - ./themes/kapp:/opt/keycloak/themes/kapp
+      ports:
+        - 8080:8080
+      networks:
+        - src-kube-network
+      depends_on:
+        - postgres
+
+volumes:
+  # Pre-upgrade Postgres 16.3 volume. Deliberately left declared but UNUSED
+  # by any service below -- this is the rollback path for the Postgres
+  # 16->18 upgrade (see docs/keycloak-backup-restore-runbook.md). Do not
+  # delete, prune, or repurpose this volume.
+  keycloack-themes-postgres:
+  # Postgres 18 data volume, created fresh for the 16->18 upgrade (data
+  # directory format is incompatible across majors, so the old volume
+  # could not be reused in place).
+  keycloack-themes-postgres-pg18:
+networks:
+  src-kube-network:
+    external: true

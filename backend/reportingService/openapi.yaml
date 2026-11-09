@@ -1,0 +1,339 @@
+openapi: 3.0.3
+info:
+  title: reportingService
+  description: >
+    Read-only, materialized reporting/analytics read-model (WP-040).
+    WP-062, ADR-007 — hand-authored, not generated. Mounted at
+    /api/v1/reports behind Kong (srckube-kong/kong.yml, host:
+    reportingservice). Covers every route in
+    backend/reportingService/routes/reports.js.
+
+    READ-AVAILABILITY POLICY (verified from controllers/reports.js's
+    getOrCompute, not assumed): a report is a CACHED, periodically
+    recomputed value (ReportCache), not computed fresh per request in the
+    common case.
+      - No cache entry yet AND a live recompute fails -> 503 (nothing
+        honest to serve).
+      - A cache entry exists AND a live recompute fails -> 200 with
+        `stale:true` and `staleReason` set, serving the last-good cached
+        value rather than failing the request.
+      - Cache entry younger than REPORT_STALE_MS (default 5 min) -> served
+        as-is, `stale:false`, no downstream call at all.
+    This is DIFFERENT from releaseService's gate-status (fails closed,
+    always fresh, no cache) and from WP-030's event publisher (fails
+    open) — three different, deliberately-chosen availability policies in
+    this codebase; do not assume they are the same.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: >
+        Numeric project id (WP-021, project-scoped from birth on this
+        service — WP-040). Missing/non-integer/foreign/non-member all
+        return 403, not 400.
+      schema: { type: integer }
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403:
+      description: Direct-to-service auth rejection, or a WP-021 X-Project-Id problem (missing/non-integer/unknown/non-member).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceUnavailable503:
+      description: No cached value exists yet and the live recompute failed (a dependency call errored/unreachable) — fails closed, never fabricates a report.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    ReportEnvelope:
+      type: object
+      description: >
+        Shared shape for every GET report route — NOT the codebase's usual
+        {success, data} single-resource envelope, and NOT the
+        advancedResults list envelope either. `data`'s inner shape is
+        report-specific (chart-primitive-shaped for the frontend's
+        BarChart/DonutChart/StatTile components — see each field's own
+        description below).
+      required: [success, projectId, reportType, computedAt, stale, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        projectId: { type: integer }
+        reportType:
+          type: string
+          enum: [coverage, pass-rate-trend, defect-summary, plan-progress, release-readiness, workload, traceability]
+        computedAt: { type: string, format: date-time }
+        stale:
+          type: boolean
+          description: true only when a live recompute just failed and this is a served-stale cached value.
+        staleReason:
+          type: string
+          description: Present only when stale is true — the recompute error message.
+        data:
+          type: object
+          description: Report-specific. See the operation's own description for this report type's known top-level keys.
+    ReleaseLensEnvelope:
+      type: object
+      description: >
+        Response envelope for GET /release-lens — deliberately NOT
+        ReportEnvelope: this is never cached (no reportType/stale
+        concept), and is keyed by releaseId within the caller's project
+        rather than by project alone.
+      required: [success, projectId, releaseId, computedAt, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        projectId: { type: integer }
+        releaseId: { type: string }
+        computedAt: { type: string, format: date-time }
+        data:
+          type: object
+          description: >
+            {release, links, requirements, testCases, defects, testPlans,
+            executions} — see services/releaseLens.js for the full,
+            authoritative shape of each.
+    RefreshReportResult:
+      type: object
+      properties:
+        reportType: { type: string }
+        success: { type: boolean }
+        computedAt: { type: string, format: date-time }
+        durationMs: { type: integer }
+        error: { type: string, description: Present only when success is false. }
+    RefreshResponse:
+      type: object
+      description: 200 if every report recomputed successfully; 207 Multi-Status if any one failed (Promise.allSettled — a failure in one report never blocks the others from refreshing).
+      required: [success, projectId, durationMs, reports]
+      properties:
+        success: { type: boolean, description: false when ANY report failed (207 case). }
+        projectId: { type: integer }
+        durationMs: { type: integer }
+        reports:
+          type: array
+          items: { $ref: '#/components/schemas/RefreshReportResult' }
+
+paths:
+  /api/v1/reports/coverage:
+    get:
+      summary: >
+        Requirement test coverage (WP-F13 Task 1, fix round 1). data:
+        {label, total, tested, untested, segments: {noTestsLinked,
+        notFullyVerified, executedFailing, executedPassing}, note?,
+        breakdown: DonutChart-shaped (four slices, one per segment)}.
+        "tested" means any requirement<->test-case LinkIssue row, either
+        direction, any linkType -- not gated on linkType:'tests'.
+        executedPassing requires EVERY linked case to have an actual Pass
+        verdict; No Run/InProgress/any unrecognised status lands in
+        notFullyVerified, never optimistically read as passing.
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/pass-rate-trend:
+    get:
+      summary: >
+        Pass rate over time. data: {xLabels, series: [{id,label,data}]}
+        (MUI x-charts LineChart shape). NOTE (verified from
+        services/passRateTrend.js): testPlanExecutionService has NO
+        per-project scoping (see that service's own spec's top-level
+        discrepancy note) — this report degrades to an EMPTY series with
+        an explanatory `note` field for any project other than the
+        Default Project (id=1), rather than silently mixing another
+        project's execution data in.
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: days
+          in: query
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/defect-summary:
+    get:
+      summary: 'Defect breakdown. data: {total, byStatus: BarChart-shaped, bySeverity: DonutChart-shaped, ...age buckets}'
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/plan-progress:
+    get:
+      summary: >
+        Test plan execution progress. data: {categories, series:
+        [executed, passed, blocked]} (BarChart-shaped). Same
+        Default-Project-only degradation note as pass-rate-trend above —
+        testPlanExecutionService is not project-scoped.
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/release-readiness:
+    get:
+      summary: 'Release gate rollup across all releases in the project. data: {total, rollup: DonutChart-shaped {green,red}, per-release detail list}'
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/workload:
+    get:
+      summary: >
+        Per-assignee workload. data: {categories, series: [assigned,
+        completed]} (BarChart-shaped). Same Default-Project-only
+        degradation note as pass-rate-trend above.
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/traceability:
+    get:
+      summary: >
+        Requirement traceability matrix (WP-F13 Task 2). data: {label, total,
+        rows: [{reqId, requirementSummary, testCases: [{TestCaseId,
+        TestCaseSummary, status}], testCount, defects: [{defectId, summary,
+        Status, Severity}], segment}], note?}. One row per requirement in the
+        project. `segment` uses the same four values /coverage reports and is
+        computed by the SAME function, so a row and the summary can never
+        disagree. `status` is the case's LATEST execution status verbatim,
+        including values outside Pass/Fail/No Run. Defects reach a row via
+        both the requirement edge and its cases' edges, de-duplicated.
+        `testCount` is an indicator of thinness, not an adequacy score --
+        adequacy is deliberately not measured here (see F22).
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+
+  /api/v1/reports/release-lens:
+    get:
+      summary: >
+        The release lens (WP-F15/F18 Task 4) — for ONE release: linked
+        requirements/test cases/defects (resolved against their owning
+        service, so a link to a since-deleted entity is silently excluded,
+        never counted), the linked defects broken down by status, the
+        release's linked test plans (Release.linkedTestPlanIds, also
+        resolved-only-what-exists), and execution results reachable
+        through those plans. Every count is reported alongside what it was
+        counted OUT OF (`links`, `testPlans.configuredCount`) so a release
+        with nothing linked reads as "0 of 0, nothing linked yet", not an
+        indistinguishable bare zero. Computed fresh on every call (never
+        cached in ReportCache — that model's key has no room for a
+        per-release dimension).
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: releaseId
+          in: query
+          required: true
+          description: The release's human id (e.g. 'REL-3'), not its Mongo _id.
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReleaseLensEnvelope' }
+        '400':
+          description: Missing `releaseId` query parameter.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404':
+          description: No release with this releaseId exists IN THE CALLER'S OWN PROJECT — either it never existed, or it belongs to a different project (never distinguished from each other, so a foreign-project release is never confirmed to exist).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+  /api/v1/reports/refresh:
+    post:
+      summary: >
+        On-demand synchronous refresh of all six reports for the caller's
+        OWN project (forwards the caller's own Authorization/X-Project-Id,
+        never a service-account token — every downstream
+        requireProjectScope() check runs as the real caller).
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: All six reports recomputed successfully.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefreshResponse' }
+        '207':
+          description: Multi-Status — one or more of the six reports failed to recompute; the others still succeeded and were re-cached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefreshResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }

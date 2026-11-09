@@ -1,0 +1,592 @@
+openapi: 3.0.3
+info:
+  title: testRepoService
+  description: >
+    Test case repository (WP-062, ADR-007 — hand-authored, not generated).
+    Mounted at /api/v1/testrepo behind Kong (srckube-kong/kong.yml,
+    host: testreposervice). Covers every route in
+    backend/testRepoService/routes/testrepo.js as of this WP; see
+    EXECUTION_LOG.md's WP-062 entry for verification notes and any
+    spec-vs-reality discrepancies found while writing this file.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. An unauthenticated or invalid-token
+        request is rejected at the gateway with **401**.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: >
+        Numeric project id (WP-021 tenant scoping). REQUIRED on every route
+        below except CSV import/export (which are documented separately —
+        see each operation). Missing, non-integer, or a project the caller
+        is not a member of all produce **403** (never 400 — see
+        service-core/middleware/projectScope.js), *after* WP-023's
+        Kong-level auth already passed.
+      schema:
+        type: integer
+    TestCaseId:
+      name: id
+      in: path
+      required: true
+      description: The document's Mongo `_id` (NOT the human-readable `TestCaseId` like `TC-1`).
+      schema:
+        type: string
+  responses:
+    Unauthorized401Kong:
+      description: >
+        No or invalid bearer token. Rejected at the gateway; the request
+        never reaches this service.
+    Forbidden403:
+      description: >
+        An X-Project-Id problem: the header is missing or non-integer, the
+        projectId is unknown, or the caller is not a member of that
+        project. All cases return this same shape, deliberately, so the
+        response cannot be used to tell them apart.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound404:
+      description: Resource not found (or belongs to a different project — WP-021 makes the two indistinguishable to the caller, by design).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadRequest400:
+      description: Validation error, or (on the list route) a filter value that could not be cast to the field's schema type (WP-013b).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+    TestStep:
+      type: object
+      properties:
+        testStep:
+          type: string
+        Expected:
+          type: string
+    TestCase:
+      type: object
+      description: >
+        `_id` is the Mongo id, used in every `:id` path parameter. WP-024's
+        audit `entityId` field holds `TestCaseId` (the human-readable
+        business id, e.g. "TC-1"), NOT `_id` — see that field's own
+        description below. Do not confuse the two.
+      properties:
+        _id:
+          type: string
+          description: Mongo document id — used in :id path params.
+        id:
+          type: integer
+          description: Numeric sequence value (service-core getNextSequence, WP-020c atomic counters).
+        TestCaseId:
+          type: string
+          description: Human-readable business id, e.g. "TC-1". This, not `_id`, is what WP-024 audit events' `entityId` field holds.
+        projectId:
+          type: integer
+          description: WP-021 tenant scope. Always stamped server-side from the verified X-Project-Id header, never trusted from the request body.
+        parentId:
+          type: integer
+        TestCaseSummary:
+          type: string
+        TestCaseDescription:
+          type: string
+        TestSteps:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestStep'
+        dynamicFields:
+          type: object
+        status:
+          type: string
+          enum: [draft, review, approved, deprecated, archived]
+        version:
+          type: integer
+        assignedTo:
+          type: string
+        createdBy:
+          type: string
+        updatedBy:
+          type: string
+        generatedBy:
+          type: string
+          description: Set to "ai" only via the WP-051 AI-accept create flow; cleared the first time a human edits a content field.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [_id, TestCaseId, projectId, TestCaseSummary, TestCaseDescription]
+    TestCaseVersion:
+      type: object
+      properties:
+        TestCaseId:
+          type: string
+        version:
+          type: integer
+        snapshot:
+          type: object
+          description: Full pre-update TestCase document, snapshotted by the findOneAndUpdate pre-hook.
+    Pagination:
+      type: object
+      properties:
+        next:
+          type: object
+          properties: { page: { type: integer }, limit: { type: integer } }
+        prev:
+          type: object
+          properties: { page: { type: integer }, limit: { type: integer } }
+    TestCaseList:
+      type: object
+      description: shared advancedResults() envelope (service-core/middleware/advancedResults.js) — every list route in this codebase that uses advancedResults() returns exactly this shape.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer, description: "Items in THIS page, not the total." }
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestCase'
+    TestCaseSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          $ref: '#/components/schemas/TestCase'
+    ImportPreviewRow:
+      type: object
+      properties:
+        line: { type: integer }
+        data: { type: object }
+        valid: { type: boolean }
+        errors:
+          type: array
+          items: { type: string }
+    ImportPreviewResponse:
+      type: object
+      required: [success, policy, willImport, summary, rows]
+      properties:
+        success: { type: boolean, enum: [true] }
+        policy: { type: string, enum: [all-or-nothing] }
+        willImport: { type: integer, description: "0 unless every row is valid — see policy." }
+        headers:
+          type: array
+          items: { type: string }
+        ignoredColumns:
+          type: array
+          items: { type: string }
+        summary:
+          type: object
+          properties:
+            totalRows: { type: integer }
+            validRows: { type: integer }
+            invalidRows: { type: integer }
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportPreviewRow'
+    ImportCommitResponse:
+      type: object
+      required: [success, policy]
+      properties:
+        success: { type: boolean }
+        policy: { type: string, enum: [all-or-nothing] }
+        created:
+          type: integer
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestCase'
+        error:
+          type: string
+          description: Present only when success is false (422 — some rows failed validation, nothing was written).
+
+paths:
+  /api/v1/testrepo:
+    get:
+      summary: List test cases (tenant-scoped, paginated, filterable)
+      description: >
+        Filters via arbitrary ?field=value query params (advancedResults()),
+        plus ?select=, ?sort=, ?page=, ?limit=. A filter value that can't be
+        cast to its field's schema type (e.g. an ObjectId field given a
+        non-ObjectId string) returns 400, not a hang (WP-013b).
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseList'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+    post:
+      summary: Create a test case
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [TestCaseSummary, TestCaseDescription]
+              properties:
+                TestCaseSummary: { type: string }
+                TestCaseDescription: { type: string }
+                TestSteps:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/TestStep'
+                parentId: { type: integer }
+                generatedBy: { type: string, description: 'Set to "ai" only by the WP-051 accept flow.' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseSingle'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testrepo/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TestCaseId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single test case by Mongo _id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseSingle'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+    put:
+      summary: Update a test case (editing a content field clears the AI-generated badge — WP-051)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Partial TestCase. `projectId` is stripped server-side even if present.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseSingle'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+    delete:
+      summary: Delete a test case
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+  /api/v1/testrepo/{id}/status:
+    parameters:
+      - $ref: '#/components/parameters/TestCaseId'
+      - $ref: '#/components/parameters/XProjectId'
+    put:
+      summary: Transition lifecycle status (validated against LIFECYCLE_STATUSES transition graph)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [draft, review, approved, deprecated, archived] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestCaseSingle'
+        '400':
+          description: Invalid status value, or a legal-enum-but-illegal transition (e.g. draft -> archived directly).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+  /api/v1/testrepo/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/TestCaseId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Version history (newest first) — full snapshots taken on every update
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, count, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TestCaseVersion'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+  /api/v1/testrepo/wildcardsearch:
+    get:
+      summary: Case-insensitive regex search over TestCaseId and TestCaseSummary
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: search
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TestCase'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testrepo/updateTestCaseByParam:
+    put:
+      summary: Update by an alternate lookup param (query-string driven)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testrepo/bulk:
+    patch:
+      summary: Bulk assign or bulk status-change, all-or-nothing (WP-043)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, action]
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+                  description: Mongo _ids, max 500.
+                action: { type: string, enum: [assign, status] }
+                assignedTo: { type: string, description: required when action=assign }
+                status: { type: string, description: required when action=status }
+      responses:
+        '200':
+          description: All items updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  policy: { type: string, enum: [all-or-nothing] }
+                  updated: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/TestCase' }
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '422':
+          description: One or more ids not found in this project, or (for action=status) an illegal transition — nothing was changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Bulk delete, all-or-nothing (WP-043)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: All items deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  policy: { type: string, enum: [all-or-nothing] }
+                  deleted: { type: integer }
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '422':
+          description: One or more ids not found in this project — nothing was deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/testrepo/import/preview:
+    post:
+      summary: Dry-run CSV import — validates every row, writes nothing (WP-045)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, mapping]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 'CSV only — multipart field name must be "file" (or "upload"). .xlsx/.xls rejected with 400.'
+                mapping:
+                  type: string
+                  description: 'JSON object string of {csvHeader: targetField}. Allowed targets are TestCaseSummary, TestCaseDescription, parentId — anything else is silently dropped and reported in ignoredColumns.'
+      responses:
+        '200':
+          description: OK — richer than the shared error envelope; see ImportPreviewResponse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportPreviewResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+  /api/v1/testrepo/import/commit:
+    post:
+      summary: Commit a CSV import, all-or-nothing (WP-045) — re-validates the whole file server-side, never trusts a prior preview
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, mapping]
+              properties:
+                file: { type: string, format: binary }
+                mapping: { type: string }
+      responses:
+        '201':
+          description: All rows imported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportCommitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401Kong'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '422':
+          description: 'One or more rows failed validation — nothing was imported (policy: all-or-nothing).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportCommitResponse'

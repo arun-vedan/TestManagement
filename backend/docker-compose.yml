@@ -1,0 +1,960 @@
+version: '3.8'
+
+services:
+  # MongoDB Service
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-srckube-data:/data/db   # Persistent volume for MongoDB data
+    environment:
+      # WP-101 — the Mongo root credentials come from backend/.env (gitignored)
+      # instead of being written here. This file is TRACKED, so every one of the
+      # 27 occurrences of this password was a committed secret, and rotating it
+      # (WP-100) meant editing 36 places across 10 tracked files.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    networks:
+        - src-kube-network  
+  redis:
+    image: redis:alpine  # Use the official Redis image from Docker Hub
+    container_name: redis  # Optional: Set a container name
+    ports:
+      # WP-030: mapped to a NON-default host port, deliberately. A stray
+      # native Homebrew redis-server (unrelated to this project) was found
+      # listening on the host's 127.0.0.1:6379 -- the exact same
+      # shadowing hazard already documented for MongoDB/MCP (see this
+      # session's environment hazards), just for Redis: any host process
+      # (e.g. a Jest suite run via `npm test`, per GR-6) connecting to
+      # "localhost:6379" silently talks to that unrelated stray instance
+      # (confirmed by INFO server: redis_version 7.0.8 / pid 2082, vs. this
+      # container's 8.10.1 / pid 1 -- and an XLEN of 0 on the host port
+      # while the container-side stream had real data). Container-to-
+      # container traffic (reach-by-name `redis:6379`, e.g. userService's
+      # Redis_URI, every producer's REDIS_URI in this file) is on the
+      # internal Docker network and is UNAFFECTED by this host port
+      # remap -- only host-side tooling needs to know about the new port.
+      - "16379:6379"
+    volumes:
+      - redis-data:/data  # Use a named volume for persistent storage
+    networks:
+        - src-kube-network
+  # testRepoService
+  testreposervice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: testRepoService/dockerfile
+    container_name: testreposervice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-testrepo?authSource=admin
+      # WP-104 -- cap on how many documents GET /wildcardsearch may return.
+      # Defaults to 100 in code (shared/service-core/utils/searchQuery.js) if unset.
+      WILDCARD_SEARCH_MAX_RESULTS: ${WILDCARD_SEARCH_MAX_RESULTS:-100}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-021: requireProjectScope() -> userService (the identity service),
+      # same env-var-names-the-target-service convention as istatusService
+      # (defectservice block below).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-024: audit()'s dedicated Mongo connection (backend/shared/
+      # service-core/audit.js). Same value as commentsservice's own
+      # MONGO_URI below -- the AuditEvent collection is homed in
+      # commentsService's existing srckube-comments database (see audit.js's
+      # header comment for the full reasoning), not a new database/service.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      # WP-030: publishEvent()'s Redis Streams connection (backend/shared/
+      # service-core/events.js) -- reach by container name like every other
+      # cross-service/broker dependency in this file, never `localhost`
+      # (see WP-012b's issuer-mismatch regression for why). Distinct from
+      # userService's separate `Redis_URI` var (its existence-cache, a
+      # different pre-existing use of the same Redis instance).
+      REDIS_URI: ${REDIS_URI}
+    ports:
+      - "3006:3000"
+    networks:
+      - src-kube-network
+# requirement service
+  requirementservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: requirementService/dockerfile
+    container_name: requirementservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-requirements?authSource=admin
+      # WP-104 -- cap on how many documents GET /wildcardsearch may return.
+      # Defaults to 100 in code (shared/service-core/utils/searchQuery.js) if unset.
+      WILDCARD_SEARCH_MAX_RESULTS: ${WILDCARD_SEARCH_MAX_RESULTS:-100}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-021: requireProjectScope() -> userService (the identity service).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-024: see the matching comment in testreposervice's block above.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      # WP-030: see the matching comment in testreposervice's block above.
+      REDIS_URI: ${REDIS_URI}
+    ports:
+      - "3005:3000"
+    networks:
+        - src-kube-network
+  #folder service    
+  folderservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: folderService/dockerfile
+    container_name: folderservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-folder?authSource=admin
+      # WP-113 — requireProjectScope() resolves membership against userService.
+      # Without this every scoped request fails CLOSED with 503 (the WP-111 lesson).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+    ports:
+      - "3003:3000" 
+    networks:
+        - src-kube-network     
+  #Field service
+  fieldsservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: fieldsService/dockerfile
+    container_name: fieldsservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-fields?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-043: fieldsService's new SavedView routes (routes/savedView.js)
+      # are the first routes in this service to call requireProjectScope()
+      # -- the pre-existing `fields` routes never adopted WP-021. Without
+      # this var, requireProjectScope() -> userService fails closed (503
+      # "identity service unavailable"), reproduced live before adding
+      # this line; see EXECUTION_LOG.md's WP-043 report. Same var name/value
+      # every other WP-021-migrated service in this file already sets.
+      userService: userservice:3000
+      # Wave A-1: fieldsservice was missing this var, unlike every other
+      # WP-021-scoped service in this file -- found while verifying the
+      # `/field` route fix (a revoked-membership test kept observing stale
+      # cached membership past the .env.test PROJECT_SCOPE_CACHE_TTL_MS=2000
+      # window because this container was silently falling back to
+      # projectScope.js's 30s default). Added for parity/test-reliability;
+      # does not change fix behavior, only cache freshness.
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+    ports:
+      - "3004:3000"
+    networks:
+        - src-kube-network
+
+  #Module service
+  moduleservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: moduleService/dockerfile
+    container_name: moduleservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-module?authSource=admin
+      # WP-114 — requireProjectScope() resolves membership against userService.
+      # Without this every scoped request fails CLOSED with 503 (the WP-111 lesson).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+    ports:
+      - "3002:3000"
+    networks:
+        - src-kube-network   
+  #Object Repo service
+  objectrepo:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: objectRepo/dockerfile
+    container_name: objectrepo
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-objectrepo?authSource=admin
+      # WP-117/118 — requireProjectScope() resolves membership against userService.
+      # Without this every scoped request fails CLOSED with 503 (the WP-111 lesson).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+    ports:
+      - "3012:3000"
+    networks:
+        - src-kube-network   
+  #Test Planning & Execution service (Sprint 1.2 consolidation pilot — strangler-fig:
+  #stood up alongside testplanservice/testexecutionservice below, not yet cut over in Kong)
+  testplanexecutionservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: testPlanExecutionService/dockerfile
+    container_name: testplanexecutionservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI_TESTPLAN: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-testplan?authSource=admin
+      MONGO_URI_TESTEXECUTION: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-testexecution?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      testRepoService: testreposervice:3000
+      # WP-024: see the matching comment in testreposervice's block above.
+      # WP-021b: this service's TestPlan/TestExecution audit events now DO
+      # have a verified projectId to stamp -- the note this comment used to
+      # carry ("not yet on requireProjectScope(), a pre-existing WP-021
+      # deferral") is stale; see controllers/testplan.js's updated comment.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      # WP-030: see the matching comment in testreposervice's block above.
+      REDIS_URI: ${REDIS_URI}
+      # WP-033: the new POST /api/v1/testexecution/ingest route uses
+      # requireAuth('results:write') (@srckube/service-core), which needs
+      # this env var to reach userService's live API-key verify endpoint
+      # (middleware/apiKeyAuth.js) -- same reach-by-container-name
+      # convention as every other cross-service env var in this file. Also
+      # required by requireProjectScope() (mounted on that same route,
+      # short-circuited for API-key callers but exercised for real when this
+      # route is called with a human Keycloak bearer instead).
+      userService: userservice:3000
+      # WP-021b: this service is now on requireProjectScope() across every
+      # route (both /testplan and /testexecution, not just /ingest) --
+      # missing this env var before meant projectScope.js's in-process
+      # project-list cache fell back to its 30s production default inside
+      # this container specifically (every OTHER requireProjectScope()
+      # service already sets it below), which made a just-revoked
+      # membership appear to still be valid for up to 30s here. Matches the
+      # same var on every other scoped service in this file.
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+    ports:
+      - "3017:3000"
+    networks:
+        - src-kube-network
+  #upload service
+  uploadservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: uploadService/dockerfile
+    container_name: uploadservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-attachments?authSource=admin
+      # WP-112 — requireProjectScope() resolves membership against userService
+      # (WP-110 architecture (c)). Without this every scoped request fails CLOSED
+      # with 503 "identity service unavailable" — the WP-111 lesson, recorded in
+      # EXECUTION_LOG.md as a checklist item for exactly this reason.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      # WP-135 — abuse and cost controls on upload. Every one is a cap with a
+      # conservative default in utils/upload.js, so the OWNER'S numbers are a
+      # config change here rather than a code change. A malformed value falls
+      # back to the default rather than removing the cap.
+      UPLOAD_MAX_FILE_BYTES: ${UPLOAD_MAX_FILE_BYTES:-26214400}
+      UPLOAD_MAX_PROJECT_BYTES: ${UPLOAD_MAX_PROJECT_BYTES:-2147483648}
+      UPLOAD_MAX_FILES_PER_REQUEST: ${UPLOAD_MAX_FILES_PER_REQUEST:-10}
+      UPLOAD_ALLOWED_MIME_TYPES: ${UPLOAD_ALLOWED_MIME_TYPES:-}
+      UPLOAD_ALLOWED_EXTENSIONS: ${UPLOAD_ALLOWED_EXTENSIONS:-}
+    ports:
+      - "3009:3000" 
+    networks:
+        - src-kube-network      
+  #user service
+  userservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: userService/dockerfile
+    container_name: userservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-user?authSource=admin
+      # WP-119 — audit() writes to the shared AuditEvent store, which lives in
+      # srckube-comments (one collection for every service's events, so the
+      # audit read API can answer across them). Without this var audit() LOGS A
+      # WARNING AND DROPS THE EVENT — it never fails the business operation, so a
+      # missing URI is silent. This service audits from WP-119 onward, so it needs it.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      # WP-132 — invitation mail. Same SMTP credentials WP-130 configured for
+      # Keycloak, read by service-core/mailer.js. Only userservice sends mail
+      # today, so only userservice receives these.
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-vedan}
+      SMTP_REPLY_TO: ${SMTP_REPLY_TO:-}
+      # Public base URL the invite LINK points at (the frontend, not this API).
+      # Never derived from request headers: those are attacker-controlled on a
+      # public endpoint and would turn an invite mail into an open redirect.
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
+      # WP-116 follow-up — createProject seeds the new project's default defect
+      # workflow via istatusservice's idempotent POST /api/v1/issuestatus/seed.
+      # Container name, never localhost (the WP-012b regression class). Best
+      # effort: if this is unset or unreachable the project is still created and
+      # the response reports statusWorkflowSeeded: false.
+      istatusService: istatusservice:3000
+      # WP-012b: KeyCloak_URI is issuer-validation only (string-matched
+      # against incoming tokens' `iss` claim, which is minted as
+      # http://localhost:8080 by this stack) — it must match the other 13
+      # services, NOT the Docker-network hostname. Outbound admin/token API
+      # calls from inside this container use KeyCloak_Admin_URI instead (see
+      # backend/userService/controllers/users.js). Splitting these was the
+      # WP-012b fix for the issuer-mismatch 403 the WP-012 migration caused
+      # by collapsing both uses onto this one var.
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Admin_URI: http://keycloak:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      Redis_URI: redis
+      # WP-022 (TD-03): the legacy JWT register/login path this JWT_SECRET/
+      # JWT_EXPIRE/JWT_COOKIE_EXPIRE config wired up (WP-012b) is retired --
+      # routes/auth.js, controllers/auth.js, middleware/auth.js are removed
+      # from the image, so these vars have no remaining consumer. See
+      # EXECUTION_LOG.md's WP-022 entry for the consumer-audit evidence.
+      # WP-032: self-referential -- only the two /api/v1/apikeys/demo/*
+      # matrix-test routes use @srckube/service-core's cross-service
+      # requireProjectScope() (to prove that real, other-service pattern
+      # end-to-end); every real userService route keeps using the local,
+      # no-self-HTTP-call middleware/apiKeyProjectScope.js instead. See
+      # EXECUTION_LOG.md's WP-032 entry.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+    ports:
+      - "3001:3000"
+    networks:
+        - src-kube-network   
+    #automation service
+  automationservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: automationService/dockerfile
+    container_name: automationservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-automation?authSource=admin
+      # WP-117/118 — requireProjectScope() resolves membership against userService.
+      # Without this every scoped request fails CLOSED with 503 (the WP-111 lesson).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+    ports:
+      - "3011:3000"  
+    networks:
+        - src-kube-network     
+   #link issue service             
+  linkissueservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: linkIssueService/dockerfile
+    container_name: linkissueservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-linkissue?authSource=admin
+      # WP-119 — audit() writes to the shared AuditEvent store, which lives in
+      # srckube-comments (one collection for every service's events, so the
+      # audit read API can answer across them). Without this var audit() LOGS A
+      # WARNING AND DROPS THE EVENT — it never fails the business operation, so a
+      # missing URI is silent. This service audits from WP-119 onward, so it needs it.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      # WP-142 — this service seals the per-project Jira API token with
+      # WP-140's encryptSecret, so it needs the credential key ring.
+      #
+      # WP-140 put these in backend/.env and wired them into NO service, so
+      # the helper was unreachable from every container (encryptSecret throws
+      # without them). Found by WP-142 being its first real consumer.
+      CREDENTIAL_KEYS: ${CREDENTIAL_KEYS}
+      CREDENTIAL_ACTIVE_KEY_ID: ${CREDENTIAL_ACTIVE_KEY_ID}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      requirementService: requirementservice:3000
+      testRepoService: testreposervice:3000
+      # WP-111 — requireProjectScope() resolves membership against userService
+      # (GET /api/v1/projects/scope/:projectId, WP-110 architecture (c)), so a
+      # newly-scoped service needs this var or every scoped request fails CLOSED
+      # with 503 "identity service unavailable". That is the correct failure mode
+      # and it is exactly how the omission surfaced: the whole WP-111 isolation
+      # suite returned 503 until this line existed.
+      # Container name, never localhost (the WP-012b regression class).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+    ports:
+      - "3013:3000"
+    networks:
+        - src-kube-network
+  #issue status service
+  istatusservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: statusService/dockerfile
+    container_name: istatusservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-issuestatus?authSource=admin
+      # WP-116 — requireProjectScope() resolves membership against userService.
+      # Without this every scoped request fails CLOSED with 503 (the WP-111 lesson).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+    ports:
+      - "3016:3000"
+    networks:
+        - src-kube-network
+  #comments service
+  commentsservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: commentsService/dockerfile
+    container_name: commentsservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-024: commentsService hosts the new GET /api/v1/audit read API,
+      # gated the same way testrepo/requirement/defects are (WP-021/WP-022:
+      # requireProjectScope() + authorize('read')) -- so it needs the same
+      # identity-service wiring those services already have.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-024: the audit read side uses the same AUDIT_MONGO_URI ->
+      # getAuditEventModel() path as every write-side caller, even though
+      # it's numerically the same value as this service's own MONGO_URI
+      # above (both point at srckube-comments) -- so there is exactly one
+      # code path (service-core's audit.js) that ever opens a connection to
+      # the AuditEvent collection, on both the read and write side.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+    ports:
+      - "3015:3000"
+    networks:
+        - src-kube-network
+  defectservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: defectService/dockerfile
+    container_name: defectservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-defects?authSource=admin
+      # WP-104 -- cap on how many documents GET /wildcardsearch may return.
+      # Defaults to 100 in code (shared/service-core/utils/searchQuery.js) if unset.
+      WILDCARD_SEARCH_MAX_RESULTS: ${WILDCARD_SEARCH_MAX_RESULTS:-100}
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB                      
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      istatusService: istatusservice:3000
+      # WP-021: requireProjectScope() -> userService (the identity service).
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-024: see the matching comment in testreposervice's block above.
+      AUDIT_MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-comments?authSource=admin
+      # WP-031: defectService is now a publishEvent() producer too (a new
+      # 'defect-assigned' event on assignment, see
+      # controllers/defects.js) -- same Redis Streams connection every other
+      # producer in this file uses (depends_on: redis added above to match).
+      REDIS_URI: ${REDIS_URI}
+    ports:
+      - "3014:3000"
+    networks:
+        - src-kube-network
+  # WP-025: releaseService — Release/Environment/QualityGate, the "Release &
+  # Quality" target service. Project-scoped from birth (requireProjectScope()
+  # -> userService), and calls testPlanExecutionService/defectService/
+  # istatusService for live gate-status evaluation (GET
+  # /api/v1/releases/:id/gate-status) — same
+  # env-var-named-after-target-service, reach-by-container-name convention as
+  # every other cross-service caller in this file.
+  releaseservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: releaseService/dockerfile
+    container_name: releaseservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-release?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      testPlanExecutionService: testplanexecutionservice:3000
+      defectService: defectservice:3000
+      istatusService: istatusservice:3000
+      # WP-021 convention: requireProjectScope() -> userService.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+    ports:
+      - "3018:3000"
+    networks:
+        - src-kube-network
+  # WP-031: notificationService -- the 16th service. Consumes
+  # execution-completed/status-changed (WP-030) and the new defect-assigned
+  # (this WP, defectservice above) Redis Streams events and writes
+  # per-recipient Notification documents; REST list/mark-read at
+  # /api/v1/notifications (Kong route added in srckube-kong/kong.yml).
+  # requireProjectScope() -> userService like every other project-scoped
+  # service, PLUS its own outbound Keycloak client_credentials call (via
+  # KeyCloak_Admin_URI, WP-012b convention) to mint a service-account token
+  # for the "who are this project's managers" lookup its status-changed(to:
+  # review) consumer rule needs (see utils/identityClient.js) -- there is no
+  # caller token to forward for that call, unlike requireProjectScope()'s
+  # own userService call, since it runs from the background consumer loop,
+  # not a request handler.
+  notificationservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: notificationService/dockerfile
+    container_name: notificationservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-notifications?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Admin_URI: http://keycloak:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-021: requireProjectScope() -> userService (the identity service).
+      # Also reused directly by utils/identityClient.js's resolveProjectManagers().
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-030/WP-031: publishEvent()/subscribe()'s Redis Streams connection
+      # -- same var every producer/consumer in this file uses.
+      REDIS_URI: ${REDIS_URI}
+    ports:
+      - "3019:3000"
+    networks:
+        - src-kube-network
+
+  # WP-040: reportingService -- the 17th service. Read-only read-model
+  # service: materializes chart-ready aggregates (coverage, pass-rate
+  # trend, defect summary, plan progress, release readiness, tester
+  # workload) into its OWN database (srckube-reporting below) by reading
+  # every source over HTTP, never by connecting to another service's
+  # database directly -- see config/db.js's header comment and
+  # services/*.js. REST at /api/v1/reports/* (Kong route added in
+  # srckube-kong/kong.yml). Same KeyCloak_Admin_URI + service-account-token
+  # pattern as notificationService above (utils/identityClient.js) for its
+  # own node-cron background refresh sweep (lib/cronJob.js), which has no
+  # caller token to forward since it isn't a request handler either.
+  reportingservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: reportingService/dockerfile
+    container_name: reportingservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-reporting?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Admin_URI: http://keycloak:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-021: requireProjectScope() -> userService.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-040: cross-service targets this read-only service reads over
+      # HTTP (container:port on the Docker network, never localhost --
+      # WP-012b). See services/serviceUrls.js.
+      requirementService: requirementservice:3000
+      defectService: defectservice:3000
+      testPlanExecutionService: testplanexecutionservice:3000
+      linkIssueService: linkissueservice:3000
+      releaseService: releaseservice:3000
+      istatusService: istatusservice:3000
+      # WP-F15/F18 Task 4 -- the release lens resolves a release's linked
+      # test cases against testRepoService directly (same container:port
+      # convention as every var above).
+      testRepoService: testreposervice:3000
+      # node-cron schedule for the background refresh sweep (default: every
+      # 5 minutes) and how long a GET .../reports/<type> serves a cached
+      # value before lazily recomputing it (ms) -- see lib/cronJob.js /
+      # controllers/reports.js.
+      REPORT_REFRESH_CRON: ${REPORT_REFRESH_CRON:-*/5 * * * *}
+      REPORT_STALE_MS: ${REPORT_STALE_MS:-300000}
+    ports:
+      - "3020:3000"
+    networks:
+        - src-kube-network
+
+  # WP-050: aiService -- the 18th service. Foundation for WP-051/052/053:
+  # a swappable provider adapter (mock + openai implementations, see
+  # aiService/providers/index.js), request/response logging to its own
+  # AiInteraction collection (configurable retention, default 30 days /
+  # no full prompt text -- see aiService/models/AiInteraction.js),
+  # per-project enable/disable (aiService/models/AiProjectSettings.js),
+  # and a per-user daily rate limit backed by the `redis` container
+  # (aiService/lib/rateLimiter.js). REST at /api/v1/ai/* (Kong route added
+  # in srckube-kong/kong.yml). AI_PROVIDER defaults to 'mock' in this
+  # environment -- no vendor account/key exists here (Phase E provider
+  # decision, EXECUTION_LOG.md's WP-050 report); flip AI_PROVIDER/AI_MODEL/
+  # AI_BASE_URL/AI_API_KEY in backend/.env to point at a real
+  # OpenAI-compatible endpoint.
+  aiservice:
+    build:
+      context: .  # backend/ root, so the Dockerfile can reach shared/service-core (Sprint 1.1)
+      dockerfile: aiService/dockerfile
+    container_name: aiservice
+    healthcheck:  # WP-061 -- hits the service's own /healthz (unauthenticated,
+      # genuinely pings Mongo/Redis, not just "process is up" -- see
+      # service-core/health.js and EXECUTION_LOG.md's WP-061 entry).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/srckube-ai?authSource=admin
+      KeyCloak_URI: http://localhost:8080
+      KeyCloak_Admin_URI: http://keycloak:8080
+      KeyCloak_Realm: srckube
+      KeyCloak_Secret: ${KEYCLOAK_SECRET}
+      # WP-101 — express-session signing key. Was hardcoded 'mySecret' in every
+      # server.js (and 'test' in service-core/keycloak.js). Unset in production the
+      # service now refuses to start rather than fall back to a shared constant.
+      SESSION_SECRET: ${SESSION_SECRET}
+      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_clientId: node-microservice
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
+      # WP-021: requireProjectScope() -> userService.
+      userService: userservice:3000
+      PROJECT_SCOPE_CACHE_TTL_MS: ${PROJECT_SCOPE_CACHE_TTL_MS}
+      # WP-051: generate-testcases reads (never writes) the requirement and
+      # a handful of approved exemplar test cases -- container:port
+      # convention, same as every other cross-service caller (WP-012b).
+      requirementService: requirementservice:3000
+      testRepoService: testreposervice:3000
+      # WP-053: summarize-report reads ONLY reportingService's own
+      # already-computed aggregates (never requirement/defect/testRepo/
+      # release service directly -- see aiService/lib/reportAggregates.js).
+      reportingService: reportingservice:3000
+      # WP-030 var name/convention reused by this service's own per-user
+      # daily AI rate limiter (lib/rateLimiter.js), not the event bus.
+      REDIS_URI: ${REDIS_URI}
+      # WP-050 -- provider selection. mock is the default and what this
+      # environment actually runs; see aiService/providers/index.js.
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      AI_MODEL: ${AI_MODEL:-gpt-4o-mini}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.openai.com/v1}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_USER_AGENT: ${AI_USER_AGENT:-srckube-aiService/1.0}
+      AI_SESSION_HEADER: ${AI_SESSION_HEADER:-}
+      # WP-166 — deployment-wide AI kill switch, checked BEFORE the
+      # per-project flag so a project admin cannot override it. Fails CLOSED:
+      # absent or any value but "true" means AI is off. Held false for the
+      # closed beta — see backend/.env.example.
+      AI_GLOBALLY_ENABLED: ${AI_GLOBALLY_ENABLED:-false}
+      AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-15000}
+      AI_DAILY_RATE_LIMIT: ${AI_DAILY_RATE_LIMIT:-50}
+      AI_LOG_RETENTION_DAYS: ${AI_LOG_RETENTION_DAYS:-30}
+      AI_STORE_FULL_TEXT: ${AI_STORE_FULL_TEXT:-false}
+      AI_LOG_PREVIEW_CHARS: ${AI_LOG_PREVIEW_CHARS:-200}
+    ports:
+      - "3021:3000"
+    networks:
+        - src-kube-network
+
+# Volumes for persistent storage
+volumes:
+  keycloack-themes-postgres:
+  mongo-srckube-data:
+    driver: local
+  redis-data:
+    driver: local
+networks:
+  src-kube-network:
+    external: true

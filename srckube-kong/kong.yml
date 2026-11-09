@@ -1,0 +1,1897 @@
+_format_version: "3.0"
+# ============================================================================
+# WP-023 — Kong JWT enforcement (defense-in-depth backstop)
+# ============================================================================
+# Purpose: reject unauthenticated/invalid-token requests AT KONG, before they
+# ever reach an upstream service, so a service that "forgot protect()" is
+# still covered. This is a BACKSTOP ONLY — every service's own
+# keycloak.protect() / requireProjectScope() / authorize() middleware stays
+# in force unchanged (backend/ was not touched by this WP).
+#
+# How it works: Kong OSS 3.4.2 has no `openid-connect` plugin (that is a Kong
+# Enterprise plugin — confirmed 404 from GET /schemas/plugins/openid-connect
+# against the running container). The stock, bundled `jwt` plugin is used
+# instead: it verifies the RS256 signature of the Keycloak-issued JWT against
+# a public key registered as a `jwt_secrets` credential below (Keycloak's
+# rotating-key JWKS is NOT fetched live — the current signing key was pulled
+# once from http://localhost:8080/realms/srckube/protocol/openid-connect/certs
+# and pinned here as a static PEM. If the realm's key ever rotates, this
+# credential's rsa_public_key must be refreshed the same way, or requests will
+# start failing at Kong even with valid Keycloak tokens).
+#
+# Keycloak's own endpoints (issuing tokens, JWKS, admin console) are not, and
+# never were, proxied through Kong at all (they're called directly at
+# localhost:8080 per backend/shared/test-utils/getServiceToken.js) — so there
+# is nothing to exclude here.
+#
+# ROLLBACK — verified one-line-per-route: every route below carries a
+#   plugins:
+#   - name: jwt
+#     enabled: true
+#     config:
+#       claims_to_verify: [exp]
+# block. To roll back JUST that route, flip `enabled: true` to
+# `enabled: false` on its jwt plugin (or delete the 5-line plugins: block)
+# and `docker restart kong`. Example of a disabled block, i.e. what "rolled
+# back" looks like for one route:
+#
+#   plugins:
+#   - name: jwt
+#     enabled: false       # <-- rollback applied: was `true`
+#     config:
+#       claims_to_verify:
+#       - exp
+#
+# To roll back EVERYTHING at once: comment out (or delete) the entire
+# `consumers:` block at the end of this file AND every `plugins:` block under
+# `routes:` above it, then `docker restart kong` — with no jwt credential
+# registered and no jwt plugin attached, Kong proxies exactly as it did
+# before this WP. Equivalently: `git checkout <pre-WP-023-sha> -- kong.yml`
+# in this submodule, then `docker restart kong`.
+# ============================================================================
+services:
+- connect_timeout: 60000
+  enabled: true
+  host: testplanexecutionservice
+  name: ExecutionService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: executionRoute
+    path_handling: v0
+    paths:
+    - /api/v1/testexecution
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  # ==========================================================================
+  # WP-033 -- CI result ingestion (POST /api/v1/testexecution/ingest). Copies
+  # WP-032's exact two-piece pattern verbatim (see that WP's own comment
+  # block on apiKeysDemoRoute above, which explicitly names this route as the
+  # thing to build): a normal strict-jwt route for everything under
+  # /api/v1/testexecution staying Keycloak-only (executionRoute, above,
+  # UNCHANGED), plus this one `config.anonymous` fallback route for the one
+  # sub-path that must also accept `X-Api-Key`. Reuses the same
+  # `apikeys-anonymous` pass-through consumer WP-032 already registered
+  # below (consumers:) -- it carries no jwt_secrets/credentials, it only
+  # exists as the "wave this through, let the upstream service decide"
+  # marker Kong's jwt plugin's `config.anonymous` requires a real consumer
+  # reference for.
+  #
+  # `@srckube/service-core`'s requireAuth('results:write') (mounted first in
+  # Express on this route -- see
+  # backend/testPlanExecutionService/routes/testexecution.js) is what
+  # actually authenticates the request once Kong waves it through: an
+  # X-Api-Key header is verified against userService live; no X-Api-Key
+  # falls back to the exact same keycloak.protect() every other route uses,
+  # so a bad/expired JWT to THIS route is rejected by the SERVICE (401),
+  # not by Kong -- same trade-off WP-032 already accepted and documented,
+  # applied to exactly this one path prefix, nothing else.
+  #
+  # PRECEDENCE -- VERIFIED EMPIRICALLY (not assumed), 2026-08-30, same method
+  # WP-032 used: Kong's router matches the request path against every
+  # route's `paths` and picks the LONGEST (most specific) matching prefix,
+  # independent of declaration order in this file.
+  #   curl -s -o /dev/null -w '%{http_code} %{header_x-kong-upstream-latency}\n' \
+  #     http://localhost:8000/api/v1/testexecution
+  #     -> 401, X-Kong-Upstream-Latency ABSENT (rejected AT Kong -- strict
+  #        executionRoute applies, unchanged)
+  #   curl -s -o /dev/null -w '%{http_code} %{header_x-kong-upstream-latency}\n' \
+  #     -X POST http://localhost:8000/api/v1/testexecution/ingest
+  #     -> 401, X-Kong-Upstream-Latency PRESENT (waved through anonymously,
+  #        rejected by the SERVICE's own requireAuth() instead -- proves
+  #        THIS route, not executionRoute, matched the more specific path)
+  # Full curl transcript recorded in EXECUTION_LOG.md's WP-033 entry.
+  - https_redirect_status_code: 426
+    name: executionIngestRoute
+    path_handling: v0
+    paths:
+    - /api/v1/testexecution/ingest
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+        anonymous: apikeys-anonymous
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: uploadservice
+  name: attachmentService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: attachmentRoute
+    path_handling: v0
+    paths:
+    - /api/v1/attachment
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: automationservice
+  name: automationService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: automationRoute
+    path_handling: v0
+    paths:
+    - /api/v1/automation
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: fieldsservice
+  name: fieldsservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: fieldroute
+    path_handling: v0
+    paths:
+    - /api/v1/fields
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  # WP-043 -- SavedView CRUD lives in fieldsService (see
+  # backend/fieldsService/models/savedView.js's header comment for the full
+  # home-decision reasoning). A second route on the SAME fieldsservice
+  # upstream, not a new service block -- same pattern as any service in
+  # this file that answers more than one path prefix.
+  - https_redirect_status_code: 426
+    name: savedviewroute
+    path_handling: v0
+    paths:
+    - /api/v1/savedviews
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: folderservice
+  name: folderservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: folderroute
+    path_handling: v0
+    paths:
+    - /api/v1/folders
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: moduleservice
+  name: moduleService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: moduleroute
+    path_handling: v0
+    paths:
+    - /api/v1/modules
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: requirementservice
+  name: requirementservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: requirementsRoute
+    path_handling: v0
+    paths:
+    - /api/v1/requirement
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testplanexecutionservice
+  name: testPlanService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testPlanRoute
+    path_handling: v0
+    paths:
+    - /api/v1/testplan
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testreposervice
+  name: testRepoService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testRepoRoute
+    path_handling: v0
+    paths:
+    - /api/v1/testrepo
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: sharedStepRoute
+    path_handling: v0
+    paths:
+    - /api/v1/sharedstep
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: datasetRoute
+    path_handling: v0
+    paths:
+    - /api/v1/dataset
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: caseTemplateRoute
+    path_handling: v0
+    paths:
+    - /api/v1/casetemplate
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: userservice
+  name: userService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: userRoute
+    path_handling: v0
+    paths:
+    - /api/v1/users/kcUser
+    # The people on one project, replacing the realm-wide user list the
+    # assignee picker used to read. A separate path entry because
+    # /api/v1/users/kcUser only prefix-matches kcUser/kcUsers.
+    - /api/v1/users/directory
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: organizationRoute
+    path_handling: v0
+    paths:
+    - /api/v1/organizations
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  # ==========================================================================
+  # WP-132 — invitation acceptance. Separate from projectRoute because the
+  # caller is NOT a member of the project yet: that is the state an invitee is
+  # in by definition. Still behind the same strict jwt plugin as every other
+  # route here — accepting requires a real logged-in Keycloak identity, since
+  # the invite is bound to the email claim in the caller's own token. The
+  # project-scoped invite routes (/api/v1/projects/:id/invites) need no entry
+  # of their own: projectRoute below already prefix-matches them.
+  - https_redirect_status_code: 426
+    name: inviteRoute
+    path_handling: v0
+    paths:
+    - /api/v1/invites
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: projectRoute
+    path_handling: v0
+    paths:
+    - /api/v1/projects
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  # ==========================================================================
+  # WP-032 — API key management (strict jwt, human Keycloak bearer ONLY,
+  # unchanged from every other route above). Covers create/list/revoke
+  # (backend/userService/routes/apikeys.js '/') and the internal
+  # container-to-container-only /verify sub-path -- an external caller
+  # reaching /verify through Kong still needs a valid JWT here as a harmless
+  # extra backstop; the endpoint's real callers (other services'
+  # requireAuth() middleware) always call it directly by container hostname
+  # (http://userservice:3000/...), bypassing Kong entirely, so this
+  # requirement never applies to them.
+  - https_redirect_status_code: 426
+    name: apiKeysRoute
+    path_handling: v0
+    paths:
+    - /api/v1/apikeys
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  # ==========================================================================
+  # WP-032 Kong-layer answer — how an API-key request (no Keycloak bearer at
+  # all, just `X-Api-Key: <keyId>.<secret>`) reaches the service without
+  # weakening WP-023's backstop everywhere else.
+  #
+  # The stock jwt plugin has no notion of "or accept this other credential
+  # instead" -- it can only verify-or-reject a JWT. Kong OSS's supported
+  # escape hatch is `config.anonymous`: on auth failure (missing OR invalid
+  # JWT), instead of rejecting, the request is waved through tagged as the
+  # named anonymous consumer, and it becomes the upstream SERVICE's job to
+  # decide whether to accept it. That is exactly what
+  # @srckube/service-core's requireAuth() (middleware/apiKeyAuth.js) does:
+  # no X-Api-Key header -> falls back to keycloak.protect(), which still
+  # fully verifies the JWT itself and rejects a missing/invalid/expired one
+  # with its own 401/403 -- Kong waving it through anonymously does not
+  # bypass that, it just moves WHERE the rejection happens, from Kong to the
+  # service, for this one route only.
+  #
+  # This is a real, explicit tradeoff, applied ONLY to this one path prefix
+  # (Kong's router matches the more specific /api/v1/apikeys/demo prefix
+  # over the less-specific strict-jwt /api/v1/apikeys route above for
+  # anything under it -- verified empirically, see EXECUTION_LOG.md's WP-032
+  # entry): a request with a bad/expired JWT to THIS route is no longer
+  # rejected AT Kong (losing the "X-Kong-Upstream-Latency absent" proof
+  # WP-023 established), because it still needs to be waved through
+  # anonymously to give a valid API-key-bearing request anywhere to land.
+  # Every other route in this file (users/kcUser, organizations, projects,
+  # apiKeysRoute above, and all 15 other services) is completely untouched
+  # -- this pattern is opt-in per-route, not a global change to the jwt
+  # plugin's behavior.
+  #
+  # WP-033 (DONE, 2026-08-30): the real CI-result-ingestion route landed on
+  # backend/testPlanExecutionService (POST /api/v1/testexecution/ingest),
+  # not defectService as originally sketched here -- see `executionIngestRoute`
+  # below (grouped with `executionRoute`, the ExecutionService service block
+  # at the top of this file) for the copy of this exact two-piece pattern,
+  # and EXECUTION_LOG.md's WP-033 entry for the empirically-verified
+  # route-precedence proof.
+  - https_redirect_status_code: 426
+    name: apiKeysDemoRoute
+    path_handling: v0
+    paths:
+    - /api/v1/apikeys/demo
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+        anonymous: apikeys-anonymous
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: defectservice
+  name: defectservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: defectRoute
+    path_handling: v0
+    paths:
+    - /api/v1/defects
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: linkissueservice
+  name: linkissueservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: linkroute
+    path_handling: v0
+    paths:
+    - /api/v1/linkIssue
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: istatusservice
+  name: istatusservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: istatusroute
+    path_handling: v0
+    paths:
+    - /api/v1/issuestatus
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: commentsservice
+  name: commentsservice
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: commentsroute
+    path_handling: v0
+    paths:
+    - /api/v1/comments
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: auditroute
+    path_handling: v0
+    paths:
+    - /api/v1/audit
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: objectrepo
+  name: objectRepoService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: objectRepoRoute
+    path_handling: v0
+    paths:
+    - /api/v1/objectrepo
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: releaseservice
+  name: releaseService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: releasesRoute
+    path_handling: v0
+    paths:
+    - /api/v1/releases
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  - https_redirect_status_code: 426
+    name: environmentsRoute
+    path_handling: v0
+    paths:
+    - /api/v1/environments
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+# WP-031 — notificationService, the 16th service (backend/notificationService).
+# Strict jwt, same as every other route in this file -- notificationService
+# has no unauthenticated/API-key surface, unlike WP-032's apiKeysDemoRoute
+# above.
+- connect_timeout: 60000
+  enabled: true
+  host: notificationservice
+  name: notificationService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: notificationsRoute
+    path_handling: v0
+    paths:
+    - /api/v1/notifications
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+# WP-040: reportingService -- the 17th service. Read-only read-model
+# service; REST at /api/v1/reports/*.
+- connect_timeout: 60000
+  enabled: true
+  host: reportingservice
+  name: reportingService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: reportsRoute
+    path_handling: v0
+    paths:
+    - /api/v1/reports
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+# WP-050: aiService -- the 18th service. Provider-agnostic AI foundation
+# (mock + openai adapter implementations, mock default); REST at
+# /api/v1/ai/*.
+- connect_timeout: 60000
+  enabled: true
+  host: aiservice
+  name: aiService
+  port: 3000
+  protocol: http
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: aiRoute
+    path_handling: v0
+    paths:
+    - /api/v1/ai
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: false
+    plugins:
+    - name: jwt
+      enabled: true
+      config:
+        claims_to_verify:
+        - exp
+  write_timeout: 60000
+# ============================================================================
+# WP-061 -- /healthz routes, deliberately UNAUTHENTICATED (no jwt plugin
+# attached, unlike every route above). An orchestrator/probe cannot present
+# a Keycloak bearer token, so a health endpoint sitting behind WP-023's jwt
+# plugin would be unprobeable through Kong -- these routes exist so
+# `curl http://localhost:8000/healthz/<service>` works with NO
+# Authorization header, while every other path on the same upstream stays
+# exactly as protected as WP-023 left it (these are separate Kong
+# `services`/`routes` entries, pointed at the same host:port -- the main
+# API service objects above are UNTOUCHED).
+#
+# service-level `path: /healthz` + route-level `strip_path: true` means:
+# request to /healthz/<name> -> Kong strips the matched route path (leaving
+# nothing) -> Kong prepends the service's `path` -> upstream receives
+# exactly `/healthz`, regardless of what the public route path was.
+#
+# /metrics is deliberately NOT given the same treatment -- see
+# EXECUTION_LOG.md's WP-061 entry for why (operational data, no external
+# consumer at the gateway edge; a future Prometheus scraper reaches each
+# container directly on the internal Docker network instead).
+# ============================================================================
+- connect_timeout: 60000
+  enabled: true
+  host: testreposervice
+  name: testreposerviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testreposerviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/testreposervice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: requirementservice
+  name: requirementserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: requirementserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/requirementservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: folderservice
+  name: folderserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: folderserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/folderservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: fieldsservice
+  name: fieldsserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: fieldsserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/fieldsservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: moduleservice
+  name: moduleserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: moduleserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/moduleservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: objectrepo
+  name: objectrepoHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: objectrepoHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/objectrepo
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testplanexecutionservice
+  name: testplanexecutionserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testplanexecutionserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/testplanexecutionservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: uploadservice
+  name: uploadserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: uploadserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/uploadservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: userservice
+  name: userserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: userserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/userservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: automationservice
+  name: automationserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: automationserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/automationservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: linkissueservice
+  name: linkissueserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: linkissueserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/linkissueservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: istatusservice
+  name: istatusserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: istatusserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/istatusservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: commentsservice
+  name: commentsserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: commentsserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/commentsservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: defectservice
+  name: defectserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: defectserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/defectservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: releaseservice
+  name: releaseserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: releaseserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/releaseservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: notificationservice
+  name: notificationserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: notificationserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/notificationservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: reportingservice
+  name: reportingserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: reportingserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/reportingservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: aiservice
+  name: aiserviceHealth
+  port: 3000
+  protocol: http
+  path: /healthz
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: aiserviceHealthRoute
+    path_handling: v0
+    paths:
+    - /healthz/aiservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+# ============================================================================
+# WP-062 (ADR-007) -- OpenAPI docs routes, deliberately UNAUTHENTICATED (no
+# jwt plugin attached), same treatment WP-061 gave /healthz above and for
+# the same reason: a docs consumer landing on these pages has no Keycloak
+# bearer token to present, and published API documentation is meant to be
+# reachable without one. These are separate Kong `services`/`routes`
+# entries pointed at the same host:port as each service's real API -- the
+# main `/api/v1/...` service objects above are UNTOUCHED, exactly as
+# WP-061 left /healthz's siblings.
+#
+# Two routes per covered service (8 of 18 -- see EXECUTION_LOG.md's WP-062
+# entry for which and why):
+#   /docs/<name>          -> upstream `/docs`          (HTML viewer)
+#   /openapi/<name>.yaml  -> upstream `/openapi.yaml`  (raw spec)
+# Both use `strip_path: true` with the service-level `path:` override, same
+# mechanism as the /healthz block above.
+# ============================================================================
+- connect_timeout: 60000
+  enabled: true
+  host: testreposervice
+  name: testreposerviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testreposerviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/testreposervice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testreposervice
+  name: testreposerviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testreposerviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/testreposervice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: requirementservice
+  name: requirementserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: requirementserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/requirementservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: requirementservice
+  name: requirementserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: requirementserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/requirementservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: defectservice
+  name: defectserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: defectserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/defectservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: defectservice
+  name: defectserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: defectserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/defectservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testplanexecutionservice
+  name: testplanexecutionserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testplanexecutionserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/testplanexecutionservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: testplanexecutionservice
+  name: testplanexecutionserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: testplanexecutionserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/testplanexecutionservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: reportingservice
+  name: reportingserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: reportingserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/reportingservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: reportingservice
+  name: reportingserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: reportingserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/reportingservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: releaseservice
+  name: releaseserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: releaseserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/releaseservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: releaseservice
+  name: releaseserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: releaseserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/releaseservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: aiservice
+  name: aiserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: aiserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/aiservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: aiservice
+  name: aiserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: aiserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/aiservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: userservice
+  name: userserviceDocs
+  port: 3000
+  protocol: http
+  path: /docs
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: userserviceDocsRoute
+    path_handling: v0
+    paths:
+    - /docs/userservice
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+- connect_timeout: 60000
+  enabled: true
+  host: userservice
+  name: userserviceOpenApi
+  port: 3000
+  protocol: http
+  path: /openapi.yaml
+  read_timeout: 60000
+  retries: 5
+  routes:
+  - https_redirect_status_code: 426
+    name: userserviceOpenApiRoute
+    path_handling: v0
+    paths:
+    - /openapi/userservice.yaml
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    request_buffering: true
+    response_buffering: true
+    strip_path: true
+  write_timeout: 60000
+consumers:
+- username: keycloak-srckube
+  custom_id: keycloak-realm-srckube
+  jwt_secrets:
+  - key: http://localhost:8080/realms/srckube
+    algorithm: RS256
+    rsa_public_key: |
+      -----BEGIN PUBLIC KEY-----
+      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDS
+      U8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQ
+      WbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3
+      T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+A
+      d3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27F
+      YitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQ
+      iwIDAQAB
+      -----END PUBLIC KEY-----
+# WP-032: pass-through identity for apiKeysDemoRoute's jwt plugin
+# `config.anonymous` (see that route's own comment above). Carries no
+# jwt_secrets/credentials on purpose -- it is never authenticated as
+# itself, only used as the "let it through unauthenticated, the upstream
+# service decides" marker Kong's jwt plugin requires a real consumer
+# reference for.
+- username: apikeys-anonymous
+  custom_id: wp032-apikeys-anonymous-passthrough
+# ----------------------------------------------------------------------------
+# WP-023 follow-up: preserve x-correlation-id propagation on Kong-level
+# rejections. Every service already echoes a caller-supplied x-correlation-id
+# back on its own responses, including ones it rejects (see
+# linkIssueService/__tests__/api.test.js "correlation ID propagation"). Once
+# the jwt plugin above starts rejecting unauthenticated requests AT KONG, the
+# service's own echo-back code never runs for those requests, breaking that
+# behavior. This global pre-function plugin restores it at the Kong layer:
+# it stages the response header in the `access` phase (pre-function's default
+# priority runs before the route-scoped jwt plugin), so the header is present
+# on Kong's own 401 as well as on anything actually proxied to upstream.
+# ROLLBACK: delete this `plugins:` block (or set enabled: false) and
+# `docker restart kong`.
+plugins:
+- name: pre-function
+  enabled: true
+  config:
+    access:
+    - |
+      local cid = kong.request.get_header("x-correlation-id")
+      if cid then
+        kong.response.set_header("x-correlation-id", cid)
+      end
+
+# ============================================================================
+# WP-063 — CORS preflight (found by the first real-browser test in this repo)
+# ============================================================================
+# Every browser call this app makes carries an `Authorization` header, which is
+# not CORS-safelisted, so the browser sends an `OPTIONS` preflight first. In dev
+# the app is served from http://localhost:3000 but calls Kong at
+# http://localhost:8000 — cross-origin, so that preflight always applies.
+#
+# Without this plugin the route-scoped `jwt` plugin ran on the preflight itself
+# and rejected it 401 with no `Access-Control-*` headers, so the browser never
+# sent the real request: every /api/v1/* call failed as net::ERR_FAILED. The
+# upstream services already handle CORS correctly
+# (backend/shared/service-core/security.js sets `cors()` and `app.options('*')`),
+# but Kong's 401 meant the request never reached them.
+#
+# This was invisible to every earlier work package because jsdom (craco test)
+# and Node-side axios (getServiceToken.js) do not enforce CORS at all — only a
+# real browser does. Production never hit it either: .env.production points the
+# app at https://srckube.com, which is same-origin (no preflight).
+#
+# Kong's `cors` plugin has priority 2000 vs the `jwt` plugin's 1450, so it runs
+# FIRST and answers the preflight itself; `preflight_continue: false` means the
+# OPTIONS never reaches the jwt plugin. Authentication on real (non-OPTIONS)
+# requests is entirely unchanged — jwt still runs on those.
+# ROLLBACK: delete this `- name: cors` entry (or set `enabled: false`) and
+# `docker restart kong`.
+- name: cors
+  enabled: true
+  config:
+    origins:
+    - http://localhost:3000
+    methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - HEAD
+    - OPTIONS
+    headers:
+    - Accept
+    - Content-Type
+    - Authorization
+    - X-Project-Id
+    - X-Correlation-Id
+    exposed_headers:
+    - X-Correlation-Id
+    credentials: true
+    max_age: 3600
+    preflight_continue: false

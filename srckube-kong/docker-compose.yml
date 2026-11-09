@@ -1,0 +1,137 @@
+version: '3.8'
+
+services:
+  kong:
+    image: kong:3.4
+    container_name: kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_PG_PASSWORD: kong
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      # WP-101 -- the Admin API binds to the container's loopback ONLY.
+      #
+      # It was 0.0.0.0:8001 with no authentication, and the published port
+      # below made it reachable from anything that could reach the host.
+      # Measured before this change: GET :8001/routes returned 200 and
+      # enumerated all 65 routes with their plugins, and GET :8001/ disclosed
+      # the Kong version and full configuration.
+      #
+      # The serious part is not the read. In DB-less mode route/service writes
+      # are refused (405), which is reassuring and also misleading -- DB-less
+      # Kong has exactly one write path, POST /config, and it was live.
+      # Probed with deliberately invalid YAML: HTTP 400 "declarative config is
+      # invalid", i.e. the endpoint accepts writes and merely rejected that
+      # body. A VALID config posted there replaces the whole gateway
+      # configuration, so an unauthenticated caller could have stripped every
+      # jwt plugin and left all 18 services anonymous behind the proxy.
+      #
+      # Loopback-only is the fix the plan asks for, and it costs nothing
+      # operationally, because in DB-less mode the Admin API is NOT how this
+      # gateway is configured -- ./kong.yml is, and it is version-controlled.
+      # The working paths, all verified against this image:
+      #
+      #   docker exec kong kong reload   # apply an edited kong.yml
+      #   docker exec kong kong health   # is it up
+      #
+      # The Kong image ships NO http client -- there is no curl and no wget in
+      # it, so the obvious `docker exec kong curl ...` does not work. If the
+      # HTTP Admin API itself is genuinely needed, OpenResty's own client is
+      # present:
+      #
+      #   docker exec kong /usr/local/openresty/bin/resty -e \
+      #     'local h=require("resty.http").new()
+      #      local r=h:request_uri("http://127.0.0.1:8001/routes")
+      #      print(r.body)'
+      #
+      # 8444 (the TLS admin listener) is dropped rather than moved to
+      # loopback: TLS to the container's own loopback protects nothing, and a
+      # second listener is a second thing to remember to keep closed.
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001
+      KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml  # Declarative configuration
+      KONG_PLUGINS: bundled
+      KONG_PORTAL: "on"
+      # WP-101 -- Kong Manager served on 8002 and is no longer published. Its
+      # listener is disabled rather than left running unreachable, so the
+      # container is not spending a port on a GUI that cannot be opened.
+      KONG_ADMIN_GUI_LISTEN: "off"
+      # ------------------------------------------------------------------
+      # TD-21 fix (WP-061) -- Kong caching a backend container's OLD IP
+      # after a rebuild, requiring `docker restart kong` (GR-5).
+      #
+      # ROOT CAUSE (verified empirically, 2026-09-01): Kong 3.4.2's own Lua
+      # DNS client (lua-resty-dns-client, used for every proxied request --
+      # DB-less "services: [{host: ...}]" entries go through the exact same
+      # resolver/balancer path as a full Upstream/Target) resolves each
+      # backend hostname ONCE and then holds that IP far longer than is
+      # useful, with no bounded re-resolution under the defaults this
+      # container ran with before this change (none of KONG_DNS_* was set).
+      # Reproduced live: rebuilt testreposervice (IP changed
+      # 172.24.0.20 -> 172.24.0.25), then hit its route through Kong
+      # *without* restarting Kong -- 502 "An invalid response was received
+      # from the upstream server", and `docker logs kong` showed Kong
+      # retrying the OLD dead IP (`connect() failed (111: Connection
+      # refused) ... upstream: "http://172.24.0.20:3000/..."`) on every
+      # request, continuously, for 30+ seconds with no sign of ever
+      # recovering on its own.
+      #
+      # This is NOT a Docker DNS problem: `docker exec kong getent hosts
+      # testreposervice` returned the correct, fresh IP immediately after
+      # the rebuild, every time. Docker's embedded DNS (127.0.0.11) was
+      # never stale -- only Kong's own client-side cache was.
+      #
+      # FIX: force a short, explicit TTL on Kong's DNS client instead of
+      # trusting whatever (effectively unbounded, in practice) caching
+      # behavior the defaults produced. Verified with the SAME
+      # rebuild-then-hit-without-restart method above, repeated several
+      # times: with these four vars set, the first request after a rebuild
+      # still 502s (the balancer is mid-flight to the dead IP), but Kong
+      # self-heals and starts routing to the NEW IP within ~1-2s (worst
+      # case observed ~1.3s in a 250ms-polling test, never more than a
+      # handful of seconds across every trial) -- fully automatically, no
+      # `docker restart kong` involved. This converts TD-21 from "broken
+      # until a human restarts Kong" into "a few seconds of 502s that clear
+      # themselves", which is the realistic ceiling for a DB-less Kong
+      # pointed at plain hostnames on a Docker user-defined network --
+      # DB-less mode does support `upstreams:`/`healthchecks:` for load-
+      # balanced multi-target pools, but that machinery does not resolve
+      # DNS any faster than these same KONG_DNS_* settings govern, so
+      # migrating all 19 declared Kong services from plain host: entries to
+      # Upstream+Target objects (a large, invasive rewrite of kong.yml)
+      # would not shrink this window any further -- not worth the risk to
+      # WP-023's jwt plugin config for no additional benefit. See
+      # EXECUTION_LOG.md's WP-061 entry for the full investigation and the
+      # verification transcript.
+      #
+      # GR-5 ("restart Kong after rebuilding any backend container") can be
+      # RETIRED as a hard requirement from this point on -- a rebuilt
+      # service becomes reachable through Kong on its own within seconds,
+      # no manual action needed. It is not literally zero-downtime (there
+      # is still a brief self-healing window right after a rebuild), so a
+      # restart is still a legitimate way to force instant recovery if
+      # someone wants zero wait, but it is no longer REQUIRED.
+      # ------------------------------------------------------------------
+      KONG_DNS_VALID_TTL: "10"
+      KONG_DNS_STALE_TTL: "2"
+      KONG_DNS_NOT_FOUND_TTL: "5"
+      KONG_DNS_ERROR_TTL: "1"
+    ports:
+      # WP-101 -- ONLY the proxy is published. 8001 (Admin API), 8444 (Admin
+      # API over TLS) and 8002 (Kong Manager) are deliberately absent: the
+      # Admin API now listens on the container's loopback, so publishing them
+      # would forward to nothing, and leaving the mappings in place would
+      # invite someone to "fix" the listener back to 0.0.0.0 to make them work.
+      - "8000:8000"
+      - "8443:8443"
+    networks:
+      - src-kube-network
+    volumes:
+      - ./kong.yml:/kong/declarative/kong.yml
+
+networks:
+  src-kube-network:
+    external: true
+

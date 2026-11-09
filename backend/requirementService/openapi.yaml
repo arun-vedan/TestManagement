@@ -1,0 +1,387 @@
+openapi: 3.0.3
+info:
+  title: requirementService
+  description: >
+    Requirements repository (WP-062, ADR-007 — hand-authored, not
+    generated). Mounted at /api/v1/requirement behind Kong
+    (srckube-kong/kong.yml, host: requirementservice). Covers every route
+    in backend/requirementService/routes/requirement.js as of this WP —
+    structurally near-identical to testRepoService's spec (same
+    requireProjectScope/advancedResults/lifecycle patterns), with
+    requirement-specific fields substituted. See EXECUTION_LOG.md's WP-062
+    entry for verification notes.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8000
+    description: Through Kong (srckube-kong) — the path every real consumer uses.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Keycloak-issued RS256 JWT. Through Kong, an unauthenticated/invalid
+        request is rejected AT KONG (WP-023's jwt plugin) with 401 — it
+        never reaches this service.
+  parameters:
+    XProjectId:
+      name: X-Project-Id
+      in: header
+      required: true
+      description: >
+        Numeric project id (WP-021). Required on every route below.
+        Missing/non-integer/foreign-project/non-member all return 403, not
+        400 (service-core/middleware/projectScope.js).
+      schema:
+        type: integer
+    RequirementId:
+      name: id
+      in: path
+      required: true
+      description: The document's Mongo _id — not the human-readable reqId (e.g. "Req-1").
+      schema:
+        type: string
+  responses:
+    Unauthorized401Kong:
+      description: No/invalid bearer token, rejected AT KONG (WP-023).
+    Forbidden403:
+      description: Direct-to-service auth rejection, or a WP-021 X-Project-Id problem (missing/non-integer/unknown/non-member).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound404:
+      description: Resource not found (or belongs to a different project — indistinguishable by design, WP-021).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadRequest400:
+      description: Validation error, or a list-route filter value that could not be cast to its field's schema type (WP-013b).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+    Requirement:
+      type: object
+      description: '`_id` is the Mongo id, used in :id path params. WP-024 audit entityId holds `reqId` (the business id, e.g. "Req-1"), not `_id`.'
+      properties:
+        _id: { type: string }
+        id: { type: integer, description: Numeric sequence value (WP-020c atomic counters). }
+        reqId: { type: string, description: 'Human-readable business id, e.g. "Req-1".' }
+        projectId: { type: integer, description: WP-021 tenant scope, stamped server-side from the verified X-Project-Id header. }
+        parentId: { type: integer }
+        requirementSummary: { type: string }
+        requirementDescription: { type: string }
+        dynamicFields: { type: object }
+        status: { type: string, enum: [draft, review, approved, deprecated, archived] }
+        version: { type: integer }
+        attachment:
+          type: array
+          items: { type: object }
+        createdBy: { type: string }
+        updatedBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [_id, reqId, projectId, requirementSummary, requirementDescription]
+    RequirementVersion:
+      type: object
+      properties:
+        reqId: { type: string }
+        version: { type: integer }
+        snapshot: { type: object }
+    Pagination:
+      type: object
+      properties:
+        next: { type: object, properties: { page: { type: integer }, limit: { type: integer } } }
+        prev: { type: object, properties: { page: { type: integer }, limit: { type: integer } } }
+    RequirementList:
+      type: object
+      description: shared advancedResults() envelope — see service-core/middleware/advancedResults.js.
+      required: [success, count, pagination, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        count: { type: integer }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Requirement' }
+    RequirementSingle:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: '#/components/schemas/Requirement' }
+    ImportPreviewRow:
+      type: object
+      properties:
+        line: { type: integer }
+        data: { type: object }
+        valid: { type: boolean }
+        errors: { type: array, items: { type: string } }
+    ImportPreviewResponse:
+      type: object
+      description: >
+        Same WP-045 shape as testRepoService's import/preview — richer
+        than the shared error envelope, NOT {success, data}.
+      required: [success, policy, willImport, summary, rows]
+      properties:
+        success: { type: boolean, enum: [true] }
+        policy: { type: string, enum: [all-or-nothing] }
+        willImport: { type: integer }
+        headers: { type: array, items: { type: string } }
+        ignoredColumns: { type: array, items: { type: string } }
+        summary:
+          type: object
+          properties:
+            totalRows: { type: integer }
+            validRows: { type: integer }
+            invalidRows: { type: integer }
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/ImportPreviewRow' }
+    ImportCommitResponse:
+      type: object
+      required: [success, policy]
+      properties:
+        success: { type: boolean }
+        policy: { type: string, enum: [all-or-nothing] }
+        created: { type: integer }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Requirement' }
+        error: { type: string, description: Present only when success is false. }
+
+paths:
+  /api/v1/requirement:
+    get:
+      summary: List requirements (tenant-scoped, paginated, filterable)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequirementList' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+    post:
+      summary: Create a requirement (starts in status "draft")
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requirementSummary, requirementDescription]
+              properties:
+                requirementSummary: { type: string }
+                requirementDescription: { type: string }
+                parentId: { type: integer }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequirementSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/requirement/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RequirementId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Get a single requirement by Mongo _id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequirementSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    put:
+      summary: Update a requirement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Partial Requirement. projectId is stripped server-side even if present.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequirementSingle' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+    delete:
+      summary: Delete a requirement
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { success: { type: boolean, enum: [true] }, data: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/requirement/{id}/status:
+    parameters:
+      - $ref: '#/components/parameters/RequirementId'
+      - $ref: '#/components/parameters/XProjectId'
+    put:
+      summary: Transition lifecycle status (validated against LIFECYCLE_STATUSES transition graph)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [draft, review, approved, deprecated, archived] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequirementSingle' }
+        '400':
+          description: Invalid status value, or a legal-enum-but-illegal transition.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/requirement/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/RequirementId'
+      - $ref: '#/components/parameters/XProjectId'
+    get:
+      summary: Version history (newest first)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, count, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/RequirementVersion' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '404': { $ref: '#/components/responses/NotFound404' }
+  /api/v1/requirement/wildcardsearch:
+    get:
+      summary: Case-insensitive regex search
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+        - name: search
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Requirement' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/requirement/updateRequirementByParam:
+    put:
+      summary: Update by an alternate lookup param (query-string driven)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      responses:
+        '200': { description: OK }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/requirement/import/preview:
+    post:
+      summary: Dry-run CSV import — validates every row, writes nothing (WP-045)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, mapping]
+              properties:
+                file: { type: string, format: binary, description: 'CSV only (multipart field "file" or "upload"); .xlsx/.xls rejected with 400.' }
+                mapping: { type: string, description: 'JSON object string of {csvHeader: targetField}.' }
+      responses:
+        '200':
+          description: OK — richer than the shared error envelope; see ImportPreviewResponse.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportPreviewResponse' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+  /api/v1/requirement/import/commit:
+    post:
+      summary: Commit a CSV import, all-or-nothing (WP-045)
+      parameters:
+        - $ref: '#/components/parameters/XProjectId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, mapping]
+              properties:
+                file: { type: string, format: binary }
+                mapping: { type: string }
+      responses:
+        '201':
+          description: All rows imported
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportCommitResponse' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '401': { $ref: '#/components/responses/Unauthorized401Kong' }
+        '403': { $ref: '#/components/responses/Forbidden403' }
+        '422':
+          description: 'One or more rows failed validation — nothing was imported (policy: all-or-nothing).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportCommitResponse' }
