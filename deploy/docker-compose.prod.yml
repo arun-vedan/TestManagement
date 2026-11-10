@@ -691,7 +691,7 @@ services:
     environment:
       POSTGRES_DB: keycloak
       POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     networks:
     - src-kube-network
     restart: unless-stopped
@@ -705,10 +705,10 @@ services:
       KC_DB: postgres
       KC_DB_URL_HOST: postgres
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: password
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
       KC_DB_SCHEMA: public
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: Pass;word1
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       JAVA_OPTS_APPEND: -Xms256m -Xmx768m
     volumes:
     - ./themes/kdk:/opt/keycloak/themes/kdk
@@ -724,7 +724,6 @@ services:
     container_name: kong
     environment:
       KONG_DATABASE: 'off'
-      KONG_PG_PASSWORD: kong
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_ADMIN_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
