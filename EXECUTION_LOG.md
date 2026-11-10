@@ -12097,3 +12097,149 @@ deploy.yml                                              valid YAML, 6 steps
   could not be removed: the Keycloak admin credentials are not in
   `/opt/vedan/.env` under any `*ADMIN*` name, and reading a client secret was
   correctly refused. **Owner action: delete these three users.**
+
+---
+
+## Two findings behind the deployment: a pipeline that had never run, and credentials in a public repo
+
+Date: 2026-11-10, following the production login verification above.
+
+### The deploy pipeline had never once succeeded
+
+Pushing the Kong fix was meant to prove the GitOps path. It proved something
+else: `kong.yml` on the server came back as the committed `localhost` value
+and was never re-rendered. Checking the run history through the public API —
+`gh` is not installed, and for a public repository the Actions endpoints
+answer anonymously:
+
+```
+Build and Deploy  12c96778  failure   <- this push
+Build and Deploy  4fd8373b  failure   <- the previous commit, believed deployed
+CI                12c96778  success
+```
+
+Both deploys failed, at the same step, and **the stack was healthy anyway
+because it had been assembled by hand, container by container.** Server
+health had been standing in for pipeline success the whole time. They are not
+the same claim and only one of them was ever checked.
+
+Step durations made the cause findable: **3s and 18s** — far too fast for the
+image-pull timeout that was my first hypothesis. Narrowing it down, each test
+run as the `deploy` user on the server:
+
+```
+docker compose config   exit 0    the file and env were never at fault
+docker compose pull      exit 0    all 20 images, using the credential that
+                                   run #7's own login had left behind in
+                                   /home/deploy/.docker/config.json
+job permissions          backend/frontend: packages: write
+                         deploy:           none
+```
+
+The `deploy` job declared no `permissions:` block, so `GITHUB_TOKEN` received
+the repository default, which carries **no `packages` scope**. `docker login
+ghcr.io -p $GITHUB_TOKEN` fails in about three seconds, and `script_stop:
+true` takes the rest of the job with it — including the step that repoints
+Kong. The build jobs were unaffected throughout because they *do* declare
+`packages: write`.
+
+One wrong turn worth recording: I reported that the image "was not found" in
+GHCR and briefly treated that as the finding. I had **mistyped the commit
+sha**. The correct tag pulls in seconds. The lesson is narrow and practical —
+when a registry says "not found", confirm the reference before concluding
+anything, because GHCR returns "not found" both for a missing tag and for an
+unauthorised one, and an anonymous pull cannot tell them apart.
+
+### Credentials were committed to a public repository
+
+Looking for the Keycloak admin credentials — to delete the test accounts the
+browser verification had created — turned up this in the committed
+`deploy/docker-compose.prod.yml`:
+
+| Variable | State |
+|---|---|
+| `KC_BOOTSTRAP_ADMIN_PASSWORD` | literal, 10 characters, dictionary-based |
+| `KC_DB_PASSWORD` / `POSTGRES_PASSWORD` | literal, the same value, committed twice |
+| `KONG_PG_PASSWORD` | literal |
+
+And `https://auth.vedan.io/admin/master/console/` returns **200**: the admin
+console answers on the public internet. A committed Keycloak admin password
+alongside a reachable console is realm takeover for anyone who opens the
+file.
+
+They originate in the *development* compose files, where localhost makes them
+merely untidy, and `generate-prod-compose.py` was copying them verbatim into
+the production file. **gitleaks did not catch them**, and could not: a short
+dictionary password matches no high-entropy pattern. The secret scan proves
+the absence of key-shaped strings, not the absence of secrets.
+
+I did not test whether the password worked. The sandbox refused the request
+as credential stuffing, which was the right call, and I did not route around
+it. The exposure is established by the committed file plus the reachable
+console without needing that confirmation.
+
+Mongo was already parameterised, and `KONG_PG_PASSWORD` turned out to be dead
+config — `KONG_DATABASE: off` means Kong runs DB-less from `kong.yml` and
+never reads it — so the real surface was narrower than the first audit
+suggested. Checking that mattered: rotating a password Kong actually depended
+on would have been a different and riskier operation.
+
+### What was done
+
+The generator now parameterises them and **refuses to write** a file in which
+any `PASSWORD`/`SECRET`/`TOKEN`-named variable still holds a literal — the
+same stance `sanitise-realm-export.py` takes, for the same reason: a trusted
+transformation that is silently incomplete is worse than none. The pattern
+deliberately excludes a bare `KEY`, because `KeyCloak_clientId`,
+`KeyCloak_Realm` and `KeyCloak_publicKey` all contain it and none is secret —
+and the guard that fired on `always_set_password_on_register_form` earlier in
+this project is the precedent for what happens to a guard that cries wolf.
+Verified by emptying `CREDENTIAL_VARS`: exit 1, three leaks named, nothing
+written.
+
+Rotated on the server, because publication means these values must be treated
+as known. Values generated with `openssl rand` **on the server**, so they
+never entered a transcript:
+
+```
+Postgres    ALTER USER keycloak WITH PASSWORD ...
+            POSTGRES_PASSWORD is read only when the data directory is
+            INITIALISED; on an existing volume it is ignored, so changing
+            only the env var leaves the two silently disagreeing.
+Keycloak    kc.sh bootstrap-admin user, in a ONE-OFF container
+            Keycloak's own recovery path, so the public password was never
+            typed. `docker exec` cannot do it: that starts a second Keycloak
+            runtime, which collides with the running server on management
+            port 9000 ("Address already in use").
+            Old `admin` deleted; `vedanadmin` is the only master-realm user.
+```
+
+Alphanumeric values only, on purpose: they pass through a JDBC URL, a YAML
+file, an `.env` parser and SQL string literals, and punctuation breaks at
+least one of those in a way that surfaces as an unrelated connection error
+days later.
+
+### Verification
+
+```
+keycloak after the password change    started in 6.0s, realm endpoint 200
+sign-in, real browser, existing user  app.vedan.io/projects/1/dashboard
+                                      GET /api/v1/projects -> 200
+master realm users                    vedanadmin only
+generator guard, deliberately broken  exit 1, no file written
+regeneration                          byte-identical on a second run
+```
+
+The sign-in test used an account that already existed rather than signing up
+again, so it added no new user.
+
+### Notes
+
+- `kc.sh bootstrap-admin` creates what Keycloak calls a **temporary** admin;
+  the console will advise creating a permanent one. It does not expire.
+- The three smoke accounts remain, by the owner's decision. They belong to no
+  organisation or project, so they can see nothing.
+- `origin` still pointed at **GitLab**; the GitHub remote was named `github`,
+  and `git push origin main` went to GitLab and was rejected on publickey, so
+  nothing reached it. The GitLab remote is now removed and GitHub renamed to
+  `origin`, per the owner's standing instruction that nothing point at GitLab.
