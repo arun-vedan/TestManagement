@@ -61,7 +61,6 @@ services:
         KC_BOOTSTRAP_ADMIN_PASSWORD: Pass;word1
       volumes:
         - ./themes/kdk:/opt/keycloak/themes/kdk      
-        - ./themes/kapp:/opt/keycloak/themes/kapp
       ports:
         - 8080:8080
       networks:

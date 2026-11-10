@@ -712,7 +712,6 @@ services:
       JAVA_OPTS_APPEND: -Xms256m -Xmx768m
     volumes:
     - ./themes/kdk:/opt/keycloak/themes/kdk
-    - ./themes/kapp:/opt/keycloak/themes/kapp
     networks:
     - src-kube-network
     depends_on:
