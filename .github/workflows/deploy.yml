@@ -241,7 +241,11 @@ jobs:
             # config while every file on disk looked correct.
             exec 3>&1
             exec >> deploy.log 2>&1
-            trap 'rc=$?; tail -80 /opt/vedan/deploy.log >&3; exit $rc' EXIT
+            # Traced into the log (not the Actions output): this step has
+            # failed for three different reasons now, and a trace names the
+            # line instead of leaving it to be inferred.
+            set -x
+            trap 'rc=$?; { tail -80 /opt/vedan/deploy.log >&3; } || true; exit $rc' EXIT
             echo "=== $(date -u +%FT%TZ) deploy ${{ github.sha }} ==="
 
             test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
@@ -305,7 +309,11 @@ jobs:
             cd /opt/vedan
             exec 3>&1
             exec >> deploy.log 2>&1
-            trap 'rc=$?; tail -80 /opt/vedan/deploy.log >&3; exit $rc' EXIT
+            # Traced into the log (not the Actions output): this step has
+            # failed for three different reasons now, and a trace names the
+            # line instead of leaving it to be inferred.
+            set -x
+            trap 'rc=$?; { tail -80 /opt/vedan/deploy.log >&3; } || true; exit $rc' EXIT
             echo "=== $(date -u +%FT%TZ) repoint ${{ github.sha }} ==="
 
             # Bind mounts resolve to an INODE at container start, and the
@@ -322,7 +330,13 @@ jobs:
               docker restart keycloak
               rm -f .themes-changed
             fi
-            AUTH_HOST=$(grep -E '^AUTH_HOST=' .env | cut -d= -f2-)
+            # NOT `grep ... | cut`: a grep that matches nothing exits 1,
+            # and under `set -o pipefail` that aborts the whole step with no
+            # message at all -- which is indistinguishable from the step
+            # dying somewhere else entirely. `sed -n ...p` exits 0 whether or
+            # not it matched, so the failure can be stated instead of guessed.
+            AUTH_HOST=$(sed -n 's/^AUTH_HOST=//p' .env | head -1 | tr -d '\r')
+            test -n "$AUTH_HOST" || { echo "AUTH_HOST is missing from /opt/vedan/.env"; exit 1; }
             ISSUER="https://${AUTH_HOST}/realms/srckube"
 
             # Keycloak is started, not necessarily ready: it imports the realm
