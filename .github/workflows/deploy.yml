@@ -138,7 +138,14 @@ jobs:
           cp -r keycloak-themes/themes/kdk keycloak-themes/themes/kapp bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
-          echo "bundle contents:"; tar -tzf bundle.tgz | head -20
+          # NOT `tar -tzf ... | head`: under `set -o pipefail`, head closing
+          # the pipe early makes tar die of SIGPIPE and the whole step fails
+          # with no useful message. Count first, then print a bounded list
+          # from a variable.
+          entries=$(tar -tzf bundle.tgz | wc -l)
+          echo "bundle: $entries entries"
+          listing=$(tar -tzf bundle.tgz)
+          echo "$listing" | sed -n '1,12p'
 
       - name: copy the bundle to the server
         uses: appleboy/scp-action@v0.1.7
