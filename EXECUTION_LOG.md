@@ -12465,3 +12465,124 @@ inline scripts audited                 no functions, continuations or
 Production was verified directly after every one of these failures, and was
 repaired by hand each time it broke — which is the thing this whole sequence
 was trying to stop being necessary.
+
+---
+
+## WP-152 — partial. A restore drill on production, and the half of the backup that was missing
+
+Date: 2026-11-10. **Not complete**: two things remain and neither is mine to finish.
+
+### The first drill passed and proved nothing
+
+`mongo-backup.sh` and `mongo-restore.sh` already existed and had been tested on
+a developer machine in August. WP-152 asks for a restore performed on the
+production host, so that was done — and the result looked perfect:
+
+```
+19 databases restored, every document count matching source
+```
+
+Every count was **zero**. Production holds no application data yet. So the run
+verified authentication, database discovery, the dump, the namespace renaming,
+the up-front collision guard and the count check, and said **nothing whatsoever**
+about whether data survives a round trip.
+
+Recorded prominently because of how convincing it looked. It is the same error
+as reading "25 containers healthy" as "the deploy works", and it would have gone
+into this log as a passed restore test.
+
+Repeated with a canary — a throwaway `srckube-backupdrill` database, never one
+of the real ones, seeded with nested arrays and non-ASCII text:
+
+```
+source documents:       3
+restored documents:     3
+byte-identical content: YES
+unicode survived:       YES
+```
+
+All 21 drill databases dropped afterwards and the canary dump deleted. Live data
+was never addressed by any restore command: `--target-prefix` renames every
+namespace, and the script aborts before touching anything if a target name
+already exists.
+
+### The backup covered Mongo and not one user account
+
+Every user, credential hash, client and authentication flow in this system lives
+in **Postgres**, behind Keycloak. The nightly backup covered Mongo only.
+Restoring from it would have produced a working application that **nobody could
+log into** — and nothing would have looked wrong, because 19 databases would
+have dumped successfully every single night.
+
+`scripts/keycloak-export.sh` existed and handles this: it reads Postgres
+directly through `kc.sh` rather than the Admin REST API, so it captures users
+*including* their password credential hashes. It had never been run here.
+
+Running it exposed why its output could not be trusted:
+
+- It verifies itself with `jq`, and **jq is not installed on this host**. It
+  printed `skipping automated content verification` and exited 0. Its own header
+  says not to trust the export until that check has run.
+- `kc.sh export` reports `Export finished successfully` and then **exits 1**,
+  because the running server already holds ports 8080/9000. The exit code is
+  meaningless here by design, so content is the only evidence available.
+
+So `deploy/verify-realm-export.py` now decides it, and **fails the backup**
+rather than letting unusable files accumulate. The case it exists for is the
+silent one: an export with zero users restores a realm nobody can enter, and the
+file looks fine at a plausible size. Service accounts are excluded from the
+credential check — they legitimately have none, and counting them would mask a
+realm whose real accounts had all lost theirs.
+
+Verified against deliberately broken exports (zero users; users without
+credentials; missing clients and flows) — each exits 1 with the reason named —
+and against the real one, which exits 0:
+
+```
+realm srckube, loginTheme kdk, 8 clients, 20 auth flows,
+12 required actions, 4 non-service users all with password credentials
+```
+
+### Retention, which the backup script does not have
+
+`mongo-backup.sh` has no pruning of any kind. On a cron it fills the disk, and a
+full disk on this box has already taken Kong and MongoDB down once.
+`deploy/backup-nightly.sh` supplies the three things the backup script
+deliberately leaves to its caller: credentials from the server's `.env`, a
+destination outside the deploy directory, and retention.
+
+It prunes **after** a successful dump, never before — pruning first would
+discard the last known-good copy to make room for one that might fail. Verified
+by backdating a dump and watching it be removed, rather than by reading the
+`find` expression.
+
+### A GitOps rule enforcing itself
+
+The wrapper failed loudly on its first full run: `scripts/keycloak-export.sh:
+No such file or directory`. The preceding deploy had wiped the copy I put on the
+host by hand, because the committed bundle did not ship it yet. Exactly right,
+and far better than silently skipping the realm half of the backup. The bundle
+now ships it, with `keycloak-import.sh`, because a restore is needed precisely
+when nobody wants to be cloning a repo first.
+
+### Still open — WP-152 is not met
+
+```
+offsite       The dumps sit on the SAME MACHINE as the database. Covers a bad
+              migration, a dropped collection, a corrupted volume. Does NOT
+              cover losing the host, which is what "backup" usually means.
+              Needs a bucket.
+
+the schedule  Installing a cron entry on the host was refused as unauthorized
+              persistence. Correct, and not routed around. One line, for the
+              owner:
+                (crontab -l 2>/dev/null; echo '17 2 * * * /opt/vedan/backup-nightly.sh') | crontab -
+              RPO 24h is not met until that exists.
+```
+
+### Correction
+
+Earlier entries said three smoke accounts were left on production. The realm
+export shows **four**: `smoke1794287412153`, `smoke1794287619975`,
+`smoke1794287654099`, `smoke1794288020038`. The third came from a verification
+run whose output I did not capture.
