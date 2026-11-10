@@ -12243,3 +12243,131 @@ again, so it added no new user.
   and `git push origin main` went to GitLab and was rejected on publickey, so
   nothing reached it. The GitLab remote is now removed and GitHub renamed to
   `origin`, per the owner's standing instruction that nothing point at GitLab.
+
+---
+
+## Three more deploy failures, and a login page that was 200 with no form on it
+
+Date: 2026-11-10, continuing from the two findings above.
+
+### A root-owned file I created myself
+
+The next deploy failed at `pull and restart` after three seconds. I had
+attributed the *previous* failures to the deploy job's missing `packages`
+scope; **that was wrong, and I had not proved it** — run #7 wrote a GHCR
+credential to `/home/deploy/.docker/config.json`, so `docker login` had
+plainly succeeded without that permission. The `packages: read` grant is
+correct for a job that pulls, and it fixed nothing.
+
+The real cause was mine. Repairing Kong by hand earlier, I created
+`/opt/vedan/.env.runtime` **as root**. The step then runs, as `deploy`:
+
+```
+touch .env.runtime
+  touch: setting times of '.env.runtime': Permission denied
+```
+
+`touch` on an existing file needs write permission on the *file*. Second time
+root-owned leftovers in `/opt/vedan` have broken this pipeline — the first was
+the stale bind-mount directories in `4fd8373`. So the fix is the pattern, not
+the `chmod`: both writes now go through a **rename**, because replacing a
+directory entry needs write permission on the *directory*, which `deploy`
+owns, and therefore works whoever owned the file before.
+
+### The login page: 200, correct files, no form
+
+The deploy then got further than any before it — all services on the new
+image, and the repoint step rewrote `kong.yml` to the real issuer. And the
+login page broke completely:
+
+```
+served page   5213 bytes, no Quasar, no Vue, menu-button-links.js
+              i.e. the STOCK Keycloak login template
+host          /opt/vedan/themes/kdk/login/login.ftl      exists
+container     /opt/keycloak/themes/kdk/login/            No such file or directory
+```
+
+**A bind mount resolves to an inode when the container starts.** The unpack
+step does `rm -rf themes realm` — it has to, because Docker creates those as
+root-owned directories wherever a mount source is missing — and then extracts
+fresh ones, which are *new inodes*. Any container compose did not recreate
+stays mounted on the deleted directory. Keycloak found no `kdk` login
+templates, fell back to `parent=base`, and served the stock page.
+
+Kong escapes this only because the repoint step restarts it; a restart
+re-resolves the host path. Keycloak is never recreated, because its
+configuration does not change between deploys. `docker restart keycloak`
+fixed it in seconds.
+
+This one is worth remembering because of how it presents: **healthy
+container, 200 response, every file on disk correct, and the product
+unusable.** Nothing short of rendering the page in a browser would have
+caught it — and the page that curl fetched looked, at a glance, like a login
+page.
+
+The unpack step now fingerprints `themes/` and `realm/` either side of the
+extract and leaves a marker; the next step restarts Keycloak only when that
+content really changed, so a routine deploy does not bounce the identity
+provider for nothing.
+
+### My own logging cost a deploy
+
+To debug without Actions log access I had each remote step tee its output to
+`/opt/vedan/deploy.log`. Written as:
+
+```
+exec > >(tee -a deploy.log) 2>&1
+```
+
+Process substitution. The shell does not wait for the background `tee`, so
+the log was truncated mid-step **and the step died before `docker restart
+kong` ran** — leaving Kong serving a stale config while the file on disk was
+correct, which is exactly the failure the step exists to prevent. A
+diagnostic that breaks the thing it is diagnosing is worse than no
+diagnostic.
+
+Replaced with a plain `>>` redirect plus an `EXIT` trap that tails the log
+back to the Actions output. Tested on the server against a deliberately
+failing script: the log is complete, the tail is echoed, and **exit code 1
+still propagates**, so a real failure continues to fail the step.
+
+### Also finished here: the Kalisio removal
+
+The earlier removal left five files. They split into two kinds, and only one
+should go:
+
+- **Removed**: `scripts/build_container.sh`, `setup_workspace.sh`,
+  `init_runner.sh` and `.gitmodules`. All three scripts source
+  `"$THIS_DIR/kash/kash.sh"` on line 10, and `scripts/kash` does not exist —
+  the submodule was never checked out and is not in the index. They could not
+  run; they were inert files naming a third party's DockerHub and repos.
+  Also `themes/kapp/`, Kalisio's example theme: unused (the realm sets
+  `loginTheme=kdk`, and `kdk`'s parent is `base`), and the only inheritance
+  runs the other way — `kapp/login` has `parent=kdk` — so nothing depends on
+  it. Its account theme was fetching a logo from `kalisio.github.io`, a
+  third-party asset shipped in the production image for a theme nothing
+  selects.
+- **Kept**: `README.md`'s attribution and `LICENSE`. The `kdk` theme *is*
+  Kalisio's, MIT-licensed, and the README says the copyright line must stay.
+  Attribution is the condition under which this code may be used, so removing
+  it would be a licence violation, not housekeeping.
+
+### Verification
+
+```
+login page after restarting keycloak   6347 bytes, 7 quasar references
+sign-in, real browser, existing user   /projects/1/dashboard
+                                       GET /api/v1/projects -> 200
+fingerprint function                   detects a one-byte change; returns the
+                                       empty-tree hash for missing dirs
+                                       instead of failing
+trap logging, failing script           log complete, tail echoed, exit 1
+                                       propagated
+kalisio references remaining            README.md only (attribution)
+```
+
+### Still open
+
+- Run #7 failed at the same step after 18s, before any of this existed, so it
+  had a different cause again. The server-side log will show it if it recurs.
+- The three smoke accounts remain, by the owner's decision.
