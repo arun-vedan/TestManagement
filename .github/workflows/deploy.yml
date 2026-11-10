@@ -147,7 +147,11 @@ jobs:
           mkdir -p bundle/themes bundle/realm
           cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
           cp srckube-kong/kong.yml bundle/kong.yml
-          cp deploy/render-kong-jwt.py deploy/remote-deploy.sh bundle/
+          cp deploy/render-kong-jwt.py deploy/remote-deploy.sh deploy/backup-nightly.sh bundle/
+          # The backup and restore scripts belong ON the host: a restore
+          # is needed exactly when nobody wants to be cloning a repo first.
+          mkdir -p bundle/scripts
+          cp scripts/mongo-backup.sh scripts/mongo-restore.sh bundle/scripts/
           cp -r keycloak-themes/themes/kdk bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
@@ -188,17 +192,17 @@ jobs:
             # Removing them works because deleting an entry needs write
             # permission on the PARENT (deploy owns /opt/vedan), not on the
             # directory itself. Done before every extract so a stale mount
-            # directory can never shadow real content.
-            # Fingerprint the bind-mounted content so the step below knows
-            # whether Keycloak has to be restarted. Cheap, and it keeps a
-            # routine deploy from bouncing the identity provider for nothing.
+            # directory can never shadow real content, and so a file deleted
+            # upstream (themes/kapp, say) does not linger on the host.
+            #
+            # The cost is that themes/ and realm/ get NEW INODES, which strands
+            # the bind mount of any container compose does not recreate. That
+            # is handled where it can be handled correctly: remote-deploy.sh
+            # asks Keycloak whether it can still see its own theme and restarts
+            # it if not, which stays right even when this step fails halfway.
+            rm -rf kong.yml themes realm render-kong-jwt.py remote-deploy.sh backup-nightly.sh scripts
             tar -xzf bundle.tgz
             rm -f bundle.tgz
-            # No fingerprinting of themes/ here any more. Replacing these
-            # directories gives them new inodes, which strands the bind mount
-            # of any container compose does not recreate -- but the deploy
-            # script detects that by asking Keycloak whether it can see its
-            # theme, which stays correct even when THIS step fails halfway.
             # No `| head` here. Under pipefail that is a SIGPIPE waiting to
             # fail the step, which is what broke the staging step one commit
             # ago.

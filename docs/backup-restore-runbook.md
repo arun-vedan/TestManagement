@@ -1,7 +1,7 @@
 # MongoDB Backup / Restore Runbook (WP-064)
 
 Scripts: `scripts/mongo-backup.sh`, `scripts/mongo-restore.sh`.
-Status: **backup + restore both work and have been tested end-to-end** (transcript below). Scheduling is **documented but not installed** — see "Is it actually scheduled?" below. Read that section before assuming this meets the RPO/RTO targets unattended.
+Status: **backup + restore both work and have been tested end-to-end** (transcript below), including **on the production host** on 2026-11-10 with a content-level fidelity check — see "Production drill" below. Scheduling is **written but NOT INSTALLED**, and backups are **NOT OFFSITE**. Read "Is it actually scheduled?" before assuming this meets the RPO/RTO targets unattended.
 
 ## What this protects
 
@@ -211,7 +211,52 @@ This is a genuinely verified restore, not a claim: dump → restore into a throw
 Strategy §14 targets: **RPO 24h / RTO 4h**.
 
 - **What exists today**: an **on-demand** backup script (`mongo-backup.sh`) that, when run, produces a complete, restorable dump in under a minute for the current ~2.4 MB of data. A restore into a throwaway target has been proven to work end-to-end (above), and a real restore into a fresh/replacement `mongodb` container (rather than a renamed sibling) is the same command with `--target-prefix` chosen to equal a *new, empty* target — the mechanism is identical.
-- **Is it actually scheduled? No.** Nothing in this repo or on this machine invokes `mongo-backup.sh` automatically. **RPO 24h is not currently met by anything running** — it would only be met from the moment a human or CI system actually schedules it. This is a real gap, stated plainly rather than glossed over.
+- **Is it actually scheduled? Not yet — one command away.** `deploy/backup-nightly.sh` now
+  exists and ships to the host in the deploy bundle. It supplies the three things
+  `mongo-backup.sh` deliberately leaves to its caller: credentials from `/opt/vedan/.env`,
+  a destination outside the deploy directory (`/var/backups/vedan/mongo`), and **retention**
+  — the backup script has none, so on a cron it would fill the disk, and a full disk on this
+  box has already taken Kong and MongoDB down once.
+
+  It has been run on production and its pruning verified by backdating a dump and watching it
+  be removed. What is missing is the cron entry itself, which must be installed by hand:
+
+  ```
+  # as the deploy user on the VPS
+  (crontab -l 2>/dev/null; echo '17 2 * * * /opt/vedan/backup-nightly.sh') | crontab -
+  ```
+
+  **RPO 24h is not met until that line exists.**
+
+- **Are the backups offsite? No.** The dumps land on the SAME MACHINE as the database. That
+  protects against a bad migration, a dropped collection or a corrupted volume, and not at
+  all against losing the host — which is the scenario people usually mean by "backup". WP-152
+  is not complete until a copy leaves this machine, and that needs a bucket.
+
+## Production drill (2026-11-10)
+
+The 2026-08-29 transcript below was run on a developer machine. WP-152 asks for a restore
+performed on the production host, which was done on 2026-11-10.
+
+The first attempt restored all 19 databases with every document count matching — **and every
+count was zero**, because production holds no data yet. That verifies the plumbing (auth,
+database discovery, dump, namespace renaming, the collision guard, the count check) and
+nothing whatsoever about data fidelity. Recorded here because a green restore of an empty
+database is the kind of evidence that looks conclusive and is not.
+
+So the drill was repeated with a canary. A throwaway `srckube-backupdrill` database (not one
+of the real ones) was seeded with three documents including nested arrays and non-ASCII text,
+dumped, restored as `restoretest_srckube-backupdrill`, and compared:
+
+```
+source documents:       3
+restored documents:     3
+byte-identical content: YES
+unicode survived:       YES
+```
+
+All 21 drill databases were then dropped and the dump containing the canary deleted. Live data
+was never addressed by any restore command — `--target-prefix` renames every namespace.
 - **To make RPO 24h real**, add a daily cron entry (adjust user/path):
   ```
   0 2 * * *  cd /path/to/srckubetest && ./scripts/mongo-backup.sh >> /var/log/srckube-mongo-backup.log 2>&1
