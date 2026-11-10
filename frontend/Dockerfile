@@ -53,6 +53,11 @@ EXPOSE 80
 # Fails the container's healthcheck if nginx is up but the bundle is missing,
 # which is otherwise a silent white page.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost/index.html >/dev/null || exit 1
+  # 127.0.0.1, not localhost: in this image localhost resolves to ::1
+  # first and nginx listens on 0.0.0.0 only, so the check failed with
+  # "connection refused" against a perfectly healthy server — and an
+  # unhealthy container is one Traefik will not route to, so the site
+  # was down with no certificate and nothing wrong with nginx.
+  CMD wget -qO- http://127.0.0.1/index.html >/dev/null || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

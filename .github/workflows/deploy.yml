@@ -120,15 +120,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: copy compose files to the server
+      # The compose files are not enough on their own. Three services bind-mount
+      # paths RELATIVE to the compose file, and Docker silently creates an
+      # empty DIRECTORY where a missing file is mounted — which is how Kong
+      # ended up in a crash loop with "kong.yml: Is a directory", and how
+      # Keycloak came up serving the stock theme instead of kdk.
+      #
+      # Built as one tarball rather than several scp globs because the sources
+      # live at different depths (srckube-kong/, keycloak-themes/themes/) and
+      # have to land in a flat layout next to the compose files.
+      - name: stage the deployment bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/themes bundle/realm
+          cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
+          cp srckube-kong/kong.yml bundle/kong.yml
+          cp -r keycloak-themes/themes/kdk keycloak-themes/themes/kapp bundle/themes/
+          cp keycloak-themes/realm/srckube-realm.json bundle/realm/
+          tar -czf bundle.tgz -C bundle .
+          echo "bundle contents:"; tar -tzf bundle.tgz | head -20
+
+      - name: copy the bundle to the server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/docker-compose.edge.yml"
+          source: bundle.tgz
           target: /opt/vedan
-          strip_components: 1
+
+      - name: unpack
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/vedan
+            # Remove any empty directory Docker created in place of a missing
+            # bind-mount target, or tar cannot replace it with the real file.
+            [ -d kong.yml ] && rm -rf kong.yml || true
+            tar -xzf bundle.tgz && rm -f bundle.tgz
+            ls -la /opt/vedan | head
 
       - name: pull and restart
         uses: appleboy/ssh-action@v1.2.0
