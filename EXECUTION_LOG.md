@@ -12371,3 +12371,97 @@ kalisio references remaining            README.md only (attribution)
 - Run #7 failed at the same step after 18s, before any of this existed, so it
   had a different cause again. The server-side log will show it if it recurs.
 - The three smoke accounts remain, by the owner's decision.
+
+---
+
+## The deploy step failed four times for four different reasons
+
+Date: 2026-11-10. Continues the deployment work above.
+
+Recorded together because the pattern matters more than any one bug.
+
+| # | Cause | Why it was hard to see |
+|---|---|---|
+| 1 | `.env.runtime` owned by root — `touch` denied | 3s failure, no message |
+| 2 | `exec > >(tee …)` process substitution | the diagnostic broke the step it was diagnosing |
+| 3 | `grep` matching nothing aborts under `pipefail` | **no output at all**, indistinguishable from any other failure |
+| 4 | multi-line function with a line continuation | runs correctly under bash; dies under the action |
+
+### The thing worth generalising
+
+Causes 2 and 4 were not logic errors. Both constructs were extracted from the
+workflow, copied to the server, and run as the `deploy` user — and both
+**succeeded, repeatedly, including the exact branch the workflow had taken**.
+They only failed inside `appleboy/ssh-action`, which does not execute
+multi-line shell constructs the way bash does.
+
+So the conclusion was not "fix the line" but **"stop putting shell in the
+YAML"**. The ~60 lines across two steps are now
+`deploy/remote-deploy.sh`, shipped in the bundle and invoked by two single
+lines. Inline shell in that action is now restricted to single simple lines;
+anything with a function, a continuation, a heredoc or a redirect of the
+shell's own descriptors lives in a file — which is also the only reason any
+of these four were pinned down, since a file can be run by hand.
+
+`render-kong-jwt.py` had been working from day one for exactly this reason.
+The shell logic should have followed it there immediately.
+
+### A fix that was the wrong shape
+
+The stale-bind-mount problem (`rm -rf themes` gives new inodes; a container
+compose did not recreate stays mounted on the deleted directory) was first
+fixed by fingerprinting `themes/` either side of the extract and leaving a
+marker file for the next step to act on.
+
+**That broke within a single deploy.** The unpack step failed *between*
+replacing `themes/` and writing the marker, so the next step read
+"unchanged" and left Keycloak serving the stock login page — reproducing the
+exact 200-with-no-form outage the marker existed to prevent, now with a
+mechanism cheerfully reporting that all was well.
+
+The replacement asks the only thing that knows:
+
+```
+docker exec keycloak test -f /opt/keycloak/themes/kdk/login/login.ftl
+```
+
+If Keycloak cannot see its own theme, restart it, then verify it can and fail
+loudly otherwise. No state carried between steps, nothing to get out of sync,
+and it self-heals whichever earlier step failed or was skipped. Confirmed
+against the real fault: `NO -- stale mount` on the broken container,
+`theme visible` after the restart, login page back to 6347 bytes from 5213.
+
+**A marker written after the risky operation cannot survive that operation
+failing.** Check the invariant, not a proxy for it.
+
+### Corrections to earlier entries in this log
+
+- The `packages: read` grant was **not** the cause of the original deploy
+  failures, and I had not proved it was. Run #7 had already written a GHCR
+  credential to `/home/deploy/.docker/config.json`, so `docker login` was
+  plainly succeeding without that permission. The grant is still correct for a
+  job that pulls; it fixed nothing.
+- The `KEYCLOAK_REALM_PUBLIC_KEY ... Defaulting to a blank string` warnings I
+  flagged as a live problem were noise. They come from the final bare
+  `docker compose ps`, which passes no `--env-file`. The services received the
+  correct 392-character key — checked inside the container.
+- An image I reported as "not found in GHCR" was a **mistyped commit sha**.
+  The correct tag pulls in seconds. GHCR returns "not found" both for a
+  missing tag and for an unauthorised one, and an anonymous pull cannot tell
+  them apart — worth knowing, but it was not the finding I presented.
+
+### Verification
+
+```
+remote-deploy.sh, run on the server    EXIT=0, pull through repoint
+browser sign-in after that run         /api/v1/projects -> 200
+theme check against the real fault     NO before restart, yes after
+login page                             6347 bytes (was 5213 when broken)
+containers                             20 healthy, 0 unhealthy
+inline scripts audited                 no functions, continuations or
+                                       process substitution remain
+```
+
+Production was verified directly after every one of these failures, and was
+repaired by hand each time it broke — which is the thing this whole sequence
+was trying to stop being necessary.
