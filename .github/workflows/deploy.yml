@@ -147,11 +147,11 @@ jobs:
           mkdir -p bundle/themes bundle/realm
           cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
           cp srckube-kong/kong.yml bundle/kong.yml
-          cp deploy/render-kong-jwt.py deploy/remote-deploy.sh deploy/backup-nightly.sh bundle/
+          cp deploy/render-kong-jwt.py deploy/remote-deploy.sh deploy/backup-nightly.sh deploy/verify-realm-export.py bundle/
           # The backup and restore scripts belong ON the host: a restore
           # is needed exactly when nobody wants to be cloning a repo first.
           mkdir -p bundle/scripts
-          cp scripts/mongo-backup.sh scripts/mongo-restore.sh bundle/scripts/
+          cp scripts/mongo-backup.sh scripts/mongo-restore.sh scripts/keycloak-export.sh scripts/keycloak-import.sh bundle/scripts/
           cp -r keycloak-themes/themes/kdk bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
@@ -200,7 +200,7 @@ jobs:
             # is handled where it can be handled correctly: remote-deploy.sh
             # asks Keycloak whether it can still see its own theme and restarts
             # it if not, which stays right even when this step fails halfway.
-            rm -rf kong.yml themes realm render-kong-jwt.py remote-deploy.sh backup-nightly.sh scripts
+            rm -rf kong.yml themes realm render-kong-jwt.py remote-deploy.sh backup-nightly.sh verify-realm-export.py scripts
             tar -xzf bundle.tgz
             rm -f bundle.tgz
             # No `| head` here. Under pipefail that is a SIGPIPE waiting to
