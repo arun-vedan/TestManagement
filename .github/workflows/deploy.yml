@@ -147,7 +147,7 @@ jobs:
           mkdir -p bundle/themes bundle/realm
           cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
           cp srckube-kong/kong.yml bundle/kong.yml
-          cp deploy/render-kong-jwt.py bundle/
+          cp deploy/render-kong-jwt.py deploy/remote-deploy.sh bundle/
           cp -r keycloak-themes/themes/kdk bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
@@ -192,201 +192,40 @@ jobs:
             # Fingerprint the bind-mounted content so the step below knows
             # whether Keycloak has to be restarted. Cheap, and it keeps a
             # routine deploy from bouncing the identity provider for nothing.
-            fp() { find themes realm -type f -exec sha256sum {} + 2>/dev/null \
-                   | sort | sha256sum | cut -d' ' -f1; }
-            before=$(fp)
-            rm -rf kong.yml themes realm render-kong-jwt.py
             tar -xzf bundle.tgz
             rm -f bundle.tgz
-            if [ "$before" != "$(fp)" ]; then
-              : > .themes-changed.tmp && mv -f .themes-changed.tmp .themes-changed
-              echo "themes/realm changed"
-            else
-              rm -f .themes-changed
-              echo "themes/realm unchanged"
-            fi
+            # No fingerprinting of themes/ here any more. Replacing these
+            # directories gives them new inodes, which strands the bind mount
+            # of any container compose does not recreate -- but the deploy
+            # script detects that by asking Keycloak whether it can see its
+            # theme, which stays correct even when THIS step fails halfway.
             # No `| head` here. Under pipefail that is a SIGPIPE waiting to
             # fail the step, which is what broke the staging step one commit
             # ago.
             echo "unpacked:"
             ls -la /opt/vedan
 
-      - name: pull and restart
+      # Everything that happens on the server lives in deploy/remote-deploy.sh,
+      # which ships in the bundle above. This step is two single-line commands
+      # on purpose.
+      #
+      # It was ~60 lines of inline shell across two steps, and it failed four
+      # times for four different causes. Two of them were not logic errors at
+      # all -- a multi-line function with a line continuation, and an
+      # `exec > >(tee ...)` process substitution. Both run correctly under bash
+      # on that box and both died here, because appleboy/ssh-action does not
+      # execute multi-line shell constructs the way bash does. So inline shell
+      # here is kept to single simple lines, and anything else goes in a file,
+      # where it is also testable by hand on the server.
+      - name: deploy on the server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
+          # The token is passed on stdin rather than as an argument, so it
+          # cannot be read out of the process list.
           script: |
-            set -euo pipefail
-            cd /opt/vedan
-            # .env lives ONLY on the server and is never in the repo or in
-            # this workflow: it holds the Keycloak secret, Mongo passwords
-            # and the credential keys.
-            # Keep a copy of this step's output ON THE SERVER. Reading an
-            # Actions log needs a token this project does not have to hand,
-            # and three deploys were debugged by inference because of it.
-            # Bounded: a deploy log nobody prunes becomes the reason a disk
-            # fills, and this box has already lost Kong and MongoDB to a full
-            # Docker VM once.
-            if [ -f deploy.log ] && [ "$(stat -c %s deploy.log)" -gt 2000000 ]; then
-              tail -c 500000 deploy.log > deploy.log.tmp && mv -f deploy.log.tmp deploy.log
-            fi
-            # A PLAIN redirect, with the tail echoed back on exit. The first
-            # attempt used `exec > >(tee -a deploy.log)`, and process
-            # substitution cost a deploy: the shell does not wait for the
-            # background tee, so the log was truncated mid-step AND the step
-            # died before restarting Kong -- which left Kong serving a stale
-            # config while every file on disk looked correct.
-            exec 3>&1
-            exec >> deploy.log 2>&1
-            # Traced into the log (not the Actions output): this step has
-            # failed for three different reasons now, and a trace names the
-            # line instead of leaving it to be inferred.
-            set -x
-            trap 'rc=$?; { tail -80 /opt/vedan/deploy.log >&3; } || true; exit $rc' EXIT
-            echo "=== $(date -u +%FT%TZ) deploy ${{ github.sha }} ==="
-
-            test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
-            echo "IMAGE_TAG=${{ github.sha }}" > .env.tag
-
-            # Holds the realm public key, which only exists once Keycloak has
-            # booted (see the repoint step below). It must exist before the
-            # --env-file reference below.
-            #
-            # NOT `touch`: touch on an existing file needs write permission on
-            # the FILE, and a file left in /opt/vedan by root makes it fail
-            # with "Permission denied" -- which is exactly what killed the two
-            # deploys after this file was first created by hand as root. Going
-            # through a rename needs write permission on the DIRECTORY, which
-            # the deploy user has, so it works whoever owns the old file.
-            # Same failure mode as the stale root-owned bind-mount dirs that
-            # broke the unpack step earlier in this project's history.
-            if [ ! -f .env.runtime ]; then
-              : > .env.runtime.tmp && mv -f .env.runtime.tmp .env.runtime
-            fi
-            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
-            docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
-              -f docker-compose.prod.yml -f docker-compose.edge.yml pull --quiet
-            docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
-              -f docker-compose.prod.yml -f docker-compose.edge.yml up -d --remove-orphans
-            # Images accumulate fast with 19 of them per deploy; the VPS has
-            # 96 GB but an unpruned host fills quietly and then nothing starts.
-            docker image prune -f --filter "until=168h"
-            docker compose -f docker-compose.prod.yml -f docker-compose.edge.yml ps
-
-      # WHY THIS STEP EXISTS, and why it cannot be a committed value.
-      #
-      # Kong validates every API token itself, in DB-less mode, against one
-      # credential in kong.yml. That credential has to match the realm that is
-      # actually running, in TWO ways, and the committed file cannot satisfy
-      # either:
-      #
-      #   the lookup key — Kong's jwt plugin finds the credential BY the
-      #   token's `iss` claim. Committed value is http://localhost:8080/...,
-      #   production issues https://${AUTH_HOST}/..., so nothing matches.
-      #
-      #   the public key — sanitise-realm-export.py deliberately strips the
-      #   realm's *KeyProvider components, because a realm's signing material
-      #   must never be committed to a public repository. Keycloak therefore
-      #   mints new keys when it first imports the realm. The correct value
-      #   does not exist until that has happened, so it can only be discovered
-      #   here.
-      #
-      # Measured before this existed: signup and login both succeeded, the app
-      # shell rendered at /projects/1/dashboard, and every API call behind it
-      # returned 401. The stack looked up and was unusable.
-      - name: supply the running realm's public key to Kong and the services
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-            cd /opt/vedan
-            exec 3>&1
-            exec >> deploy.log 2>&1
-            # Traced into the log (not the Actions output): this step has
-            # failed for three different reasons now, and a trace names the
-            # line instead of leaving it to be inferred.
-            set -x
-            trap 'rc=$?; { tail -80 /opt/vedan/deploy.log >&3; } || true; exit $rc' EXIT
-            echo "=== $(date -u +%FT%TZ) repoint ${{ github.sha }} ==="
-
-            # Bind mounts resolve to an INODE at container start, and the
-            # unpack step replaces themes/ and realm/ wholesale -- so a
-            # container that compose did not recreate stays mounted on the
-            # directory that was deleted. Kong escapes it only because it is
-            # restarted below; Keycloak is never recreated (its configuration
-            # does not change between deploys), so it kept serving a theme
-            # directory that no longer existed, fell back to parent=base, and
-            # rendered a login page with no form on it at all. The page was
-            # 200 and every file on disk was correct.
-            if [ -f .themes-changed ]; then
-              echo "theme or realm files changed; restarting keycloak to re-resolve its mounts"
-              docker restart keycloak
-              rm -f .themes-changed
-            fi
-            # NOT `grep ... | cut`: a grep that matches nothing exits 1,
-            # and under `set -o pipefail` that aborts the whole step with no
-            # message at all -- which is indistinguishable from the step
-            # dying somewhere else entirely. `sed -n ...p` exits 0 whether or
-            # not it matched, so the failure can be stated instead of guessed.
-            AUTH_HOST=$(sed -n 's/^AUTH_HOST=//p' .env | head -1 | tr -d '\r')
-            test -n "$AUTH_HOST" || { echo "AUTH_HOST is missing from /opt/vedan/.env"; exit 1; }
-            ISSUER="https://${AUTH_HOST}/realms/srckube"
-
-            # Keycloak is started, not necessarily ready: it imports the realm
-            # and builds its key set on first boot, and the key we need does
-            # not exist until that finishes.
-            for i in $(seq 1 40); do
-              curl -fsS --max-time 5 "$ISSUER" >/dev/null 2>&1 && break
-              [ "$i" = 40 ] && { echo "$ISSUER never became ready"; exit 1; }
-              sleep 3
-            done
-
-            # The SAME stale key appears in two places, and both reject
-            # tokens. Kong validates with it at the edge; each of the 18
-            # services validates with it again, offline, through
-            # keycloak-connect's realm-public-key. Fixing only Kong turns
-            # 401 into 403 and the app is still unusable — measured.
-            KEY=$(curl -fsS --max-time 10 "$ISSUER" \
-                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["public_key"])')
-            test -n "$KEY" || { echo "realm returned no public_key"; exit 1; }
-
-            env_before=$(sha256sum .env.runtime 2>/dev/null | cut -d' ' -f1 || echo none)
-            # Through a rename, so ownership of the previous file is irrelevant.
-            printf 'KEYCLOAK_REALM_PUBLIC_KEY=%s\n' "$KEY" > .env.runtime.tmp
-            mv -f .env.runtime.tmp .env.runtime
-            env_after=$(sha256sum .env.runtime | cut -d' ' -f1)
-
-            kong_before=$(sha256sum kong.yml | cut -d' ' -f1)
-            python3 render-kong-jwt.py kong.yml "$ISSUER"
-            kong_after=$(sha256sum kong.yml | cut -d' ' -f1)
-
-            # Re-apply so the services pick up the key. Compose recreates only
-            # containers whose configuration actually changed, so in steady
-            # state (same realm, same key) this is a no-op.
-            if [ "$env_before" != "$env_after" ]; then
-              echo "realm public key changed; re-applying so services pick it up"
-              docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
-                -f docker-compose.prod.yml -f docker-compose.edge.yml up -d --remove-orphans
-            else
-              echo "realm public key unchanged"
-            fi
-
-            # Kong reads kong.yml once at boot. Restart only on a real change,
-            # so a routine deploy does not drop the API for no reason.
-            if [ "$kong_before" != "$kong_after" ]; then
-              docker restart kong
-              for i in $(seq 1 30); do
-                [ "$(docker inspect -f '{{.State.Health.Status}}' kong 2>/dev/null)" = healthy ] && break
-                sleep 2
-              done
-              docker inspect -f 'kong: {{.State.Health.Status}}' kong
-            else
-              echo "kong.yml unchanged; no restart needed"
-            fi
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            bash /opt/vedan/remote-deploy.sh ${{ github.sha }}
