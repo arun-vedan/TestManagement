@@ -17,10 +17,23 @@
 
 services:
   traefik:
-    image: traefik:v3.2
+    image: traefik:v3.7
     container_name: traefik
     restart: unless-stopped
     mem_limit: 128m
+    environment:
+      # Docker 29 on this VPS refuses API versions below 1.40, and Traefik
+      # 3.2's docker provider negotiated 1.24 — "client version 1.24 is too
+      # old". It fails in the worst way: Traefik starts, redirects http to
+      # https and serves its own self-signed certificate, so the edge LOOKS
+      # up. It simply reads no container labels, so no router exists and ACME
+      # is never triggered. Diagnosed only because the certificate came back
+      # issued by "TRAEFIK DEFAULT CERT" rather than Let's Encrypt.
+      #
+      # Setting this on 3.2 did NOT fix it — that version ignores the
+      # variable — so the real fix is the 3.7 image above. Kept because it
+      # costs nothing and pins the negotiation explicitly.
+      DOCKER_API_VERSION: "1.44"
     command:
       - --providers.docker=true
       # Opt-in: a container is only routed if it carries traefik.enable=true.
