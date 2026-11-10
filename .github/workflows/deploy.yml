@@ -117,6 +117,18 @@ jobs:
     needs: [backend, frontend]
     if: github.event_name == 'push' || inputs.deploy
     runs-on: ubuntu-latest
+    # Without this the job gets the repository's DEFAULT token permissions,
+    # which carry no `packages` scope -- so `docker login ghcr.io` with
+    # GITHUB_TOKEN fails in about three seconds and, under `script_stop: true`,
+    # takes the whole deploy with it. Both deploys before this one died exactly
+    # there: the images were built and pushed fine (the build jobs below do
+    # declare packages: write), and nothing was ever pulled. The stack on the
+    # VPS was healthy only because it had been assembled by hand.
+    #
+    # `read`, not `write`: this job only pulls.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
