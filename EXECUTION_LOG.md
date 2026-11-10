@@ -12586,3 +12586,109 @@ Earlier entries said three smoke accounts were left on production. The realm
 export shows **four**: `smoke1794287412153`, `smoke1794287619975`,
 `smoke1794287654099`, `smoke1794288020038`. The third came from a verification
 run whose output I did not capture.
+
+---
+
+## A readiness check that could never succeed
+
+Date: 2026-11-10. Fifth distinct fault in the server-side deploy step, and the
+third of those five that was mine.
+
+After restarting Keycloak to re-resolve its theme mount, the script waited for
+it to come back:
+
+```
+curl -fsS --max-time 4 http://localhost:8080/realms/srckube
+```
+
+That cannot succeed on this host. `generate-prod-compose.py` strips every
+`ports:` entry so nothing but Traefik binds to the host — Keycloak publishes no
+ports at all. Measured:
+
+```
+docker port keycloak                       (prints nothing)
+curl http://localhost:8080/realms/srckube  000, exit 7 (refused)
+curl https://auth.vedan.io/realms/srckube  200
+```
+
+So the loop never checked anything. It slept the full 50 × (4 + 3) seconds and
+carried on, and it **got away with it** because by then Keycloak really was up,
+so the `docker exec keycloak test -f` immediately after passed and the deploy
+completed green.
+
+The cost was hidden rather than absent: roughly six minutes added to every
+deploy that touches the theme — which is every deploy, since unpack replaces
+`themes/` each time — against `appleboy/ssh-action`'s **10-minute default**
+`command_timeout`. Close enough to have produced intermittent failures with
+nothing in the output to explain them. `command_timeout` is now set explicitly
+to 20m, because an implicit limit that something is quietly approaching is a
+bad combination.
+
+**A readiness check that cannot ever succeed is worse than none, because it
+looks like one.** It also means some of the earlier green deploys passed for
+reasons unrelated to what that step believed it was measuring — the same class
+of problem as the marker file that reported "unchanged" while Keycloak served
+the stock theme, and as the restore drill that matched every document count
+when every count was zero.
+
+**Four instances in one session, one shape: a check that reports success
+without observing the thing it names.**
+
+| Where | Reported | Actually observed |
+|---|---|---|
+| restore drill | 19 databases, counts matched | every count was zero |
+| marker file | "themes unchanged" | Keycloak serving the stock theme |
+| readiness loop | Keycloak ready | a port that is never published |
+| the watch on the deploy | "deploy complete" | a build that had not started |
+
+The fourth deserves its own note, because it was in the tooling meant to catch
+the other three. The watch used:
+
+```
+fin=$(grep -c '<pattern>' deploy.log || echo 0)
+```
+
+`grep -c` prints `0` **and exits 1** when it matches nothing, so `|| echo 0`
+appended a second `0`. `$fin` became `"0 0"`, which is not `"0"`, so the
+success branch fired on the first poll — before the build could have finished.
+`.env.tag` still held the previous sha the whole time. Replaced with `|| true`
+(grep -c already prints a number) and, more usefully, with **three independent
+conditions**: the completion line in the log, `.env.tag`, and the running image
+must all agree on the sha, so no single bad reading can declare success.
+
+The sentence above about the server-side log being what makes these visible is
+true of the readiness bug and not a general defence: the log did not catch this
+one. Reading the *absence* of expected output did — the "timings" section came
+back empty, which is what a correct section never does.
+
+Found only by reading `deploy.log` during a run and noticing it looping on a URL
+answering `000`. The server-side log — added two commits earlier, after the
+process-substitution version of it had itself broken a deploy — is what made
+that visible.
+
+Fixed by polling `$ISSUER`, the public URL, which the realm-readiness loop
+thirty lines below was already using correctly and which is reachable from the
+host. While Keycloak is down Traefik answers 502/503, so `curl -f` fails and the
+loop actually waits.
+
+### Verification
+
+```
+in-flight deploy, before the fix     completed on its own at 07:58:40
+                                     theme visible after restart
+                                     kong health: healthy
+                                     20 containers healthy, 0 unhealthy
+browser sign-in DURING the dead loop /api/v1/projects -> 200
+                                     (Kong was still serving the correct
+                                     config from its previous restart, so this
+                                     was latency and never an outage)
+```
+
+### Correction
+
+Earlier entries said four smoke accounts remained on production. Verifying the
+signup path after the credential rotation created a fifth. Removing it was
+refused as an unverifiable deletion scope — the script picked its target at
+runtime (`sort | tail -1`) rather than naming it, which is a fair objection to
+a delete — and was not routed around. Five remain; none belongs to an
+organisation or project, so none can see anything.
