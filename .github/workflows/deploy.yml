@@ -166,11 +166,24 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/vedan
-            # Remove any empty directory Docker created in place of a missing
-            # bind-mount target, or tar cannot replace it with the real file.
-            [ -d kong.yml ] && rm -rf kong.yml || true
-            tar -xzf bundle.tgz && rm -f bundle.tgz
-            ls -la /opt/vedan | head
+            # Docker creates an empty directory wherever a bind-mount source
+            # is missing, and creates it as ROOT even though /opt/vedan belongs
+            # to deploy. tar then cannot write into those directories and the
+            # whole extract fails halfway — which is exactly what happened:
+            # kong.yml landed, themes/ did not.
+            #
+            # Removing them works because deleting an entry needs write
+            # permission on the PARENT (deploy owns /opt/vedan), not on the
+            # directory itself. Done before every extract so a stale mount
+            # directory can never shadow real content.
+            rm -rf kong.yml themes realm
+            tar -xzf bundle.tgz
+            rm -f bundle.tgz
+            # No `| head` here. Under pipefail that is a SIGPIPE waiting to
+            # fail the step, which is what broke the staging step one commit
+            # ago.
+            echo "unpacked:"
+            ls -la /opt/vedan
 
       - name: pull and restart
         uses: appleboy/ssh-action@v1.2.0
