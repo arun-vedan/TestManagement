@@ -57,7 +57,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -93,7 +93,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -129,7 +129,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
     networks:
@@ -159,7 +159,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -193,7 +193,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
     networks:
@@ -225,7 +225,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
     networks:
@@ -257,7 +257,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       testRepoService: testreposervice:3000
@@ -294,7 +294,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       UPLOAD_MAX_FILE_BYTES: ${UPLOAD_MAX_FILE_BYTES:-26214400}
       UPLOAD_MAX_PROJECT_BYTES: ${UPLOAD_MAX_PROJECT_BYTES:-2147483648}
@@ -339,7 +339,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       Redis_URI: redis
@@ -374,7 +374,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
     networks:
@@ -407,7 +407,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET}
       CREDENTIAL_KEYS: ${CREDENTIAL_KEYS}
       CREDENTIAL_ACTIVE_KEY_ID: ${CREDENTIAL_ACTIVE_KEY_ID}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       requirementService: requirementservice:3000
@@ -443,7 +443,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
     networks:
@@ -473,7 +473,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -508,7 +508,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       istatusService: istatusservice:3000
@@ -543,7 +543,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       testPlanExecutionService: testplanexecutionservice:3000
@@ -580,7 +580,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -614,7 +614,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000
@@ -657,7 +657,7 @@ services:
       KeyCloak_Realm: srckube
       KeyCloak_Secret: ${KEYCLOAK_SECRET}
       SESSION_SECRET: ${SESSION_SECRET}
-      KeyCloak_publicKey: MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApG40fNClRvzDE6hKejDSU8KKcT5DjHZqucQmmv5X/G4qk9siRMfNRgICjo4yhMCK+JAoJ33I9SRz46tdHwhQWbBdnB3kloUwKHBcXK6PJGBFRS9r0wOqKuIkZwYh7Dv1h3kbT155lTGBLMYsTCy3T74hhPdn6Z8JsN5KntRkg2y8+w8+cJJGJFt4ooZOTwngJYewJ5+vv7JapdcNap+Ad3BAT3Al2k+lCuX3TEvKmApIlUH42vtTOpYrDQZloFEto5OFJHAHBnZ4XMNIw27FYitSZ/lcUthNDvXknWvGG1FxHcuYT7VFMtwLHOAPrXh7bPmdPBjO7DwqQi1rpEBQiwIDAQAB
+      KeyCloak_publicKey: ${KEYCLOAK_REALM_PUBLIC_KEY}
       KeyCloak_clientId: node-microservice
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX}
       userService: userservice:3000

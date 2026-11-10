@@ -43,6 +43,12 @@ WHAT IT CHANGES, and why each one matters:
                          KeyCloak_Admin_URI stays internal — that one is a
                          real server-to-server call.
 
+  KeyCloak_publicKey     18 services hardcode the dev realm's public key and
+                         validate every token against it offline. The
+                         production realm's keys are generated on its first
+                         boot and cannot be committed, so this becomes an
+                         environment variable the deploy fills in.
+
   restart: unless-stopped so a reboot brings the stack back without anyone
                          logging in.
 """
@@ -95,6 +101,19 @@ def transform(name: str, svc: dict) -> dict:
             env["KeyCloak_URI"] = "${KEYCLOAK_PUBLIC_URL}"
         if "KeyCloak_Admin_URI" in env:
             env["KeyCloak_Admin_URI"] = "http://keycloak:8080"
+        # Every service validates tokens OFFLINE against this key, via
+        # keycloak-connect's realm-public-key. All 18 of them hardcode the
+        # development realm's key, and the production realm's key is a
+        # different one: sanitise-realm-export.py strips the realm's
+        # *KeyProvider components (a realm's signing material must never be
+        # committed), so Keycloak mints fresh keys when it first imports the
+        # realm. A stale key here is not a soft failure — keycloak-connect
+        # rejects every token with 403 "Access denied", which is exactly what
+        # production did: login succeeded, the dashboard rendered, and all
+        # eight of its API calls were refused. deploy.yml fetches the real
+        # value from the running realm and writes it to .env.runtime.
+        if "KeyCloak_publicKey" in env:
+            env["KeyCloak_publicKey"] = "${KEYCLOAK_REALM_PUBLIC_KEY}"
 
     return svc
 

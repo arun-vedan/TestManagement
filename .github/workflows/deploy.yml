@@ -135,6 +135,7 @@ jobs:
           mkdir -p bundle/themes bundle/realm
           cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
           cp srckube-kong/kong.yml bundle/kong.yml
+          cp deploy/render-kong-jwt.py bundle/
           cp -r keycloak-themes/themes/kdk keycloak-themes/themes/kapp bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
@@ -176,7 +177,7 @@ jobs:
             # permission on the PARENT (deploy owns /opt/vedan), not on the
             # directory itself. Done before every extract so a stale mount
             # directory can never shadow real content.
-            rm -rf kong.yml themes realm
+            rm -rf kong.yml themes realm render-kong-jwt.py
             tar -xzf bundle.tgz
             rm -f bundle.tgz
             # No `| head` here. Under pipefail that is a SIGPIPE waiting to
@@ -200,12 +201,101 @@ jobs:
             # and the credential keys.
             test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
             echo "IMAGE_TAG=${{ github.sha }}" > .env.tag
+            # Holds the realm public key, which only exists once Keycloak has
+            # booted (see the repoint step below). Created empty if absent so
+            # the --env-file reference below cannot fail on a first deploy;
+            # the repoint step then fills it and re-applies.
+            touch .env.runtime
             docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
-            docker compose --env-file .env --env-file .env.tag \
+            docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
               -f docker-compose.prod.yml -f docker-compose.edge.yml pull --quiet
-            docker compose --env-file .env --env-file .env.tag \
+            docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
               -f docker-compose.prod.yml -f docker-compose.edge.yml up -d --remove-orphans
             # Images accumulate fast with 19 of them per deploy; the VPS has
             # 96 GB but an unpruned host fills quietly and then nothing starts.
             docker image prune -f --filter "until=168h"
             docker compose -f docker-compose.prod.yml -f docker-compose.edge.yml ps
+
+      # WHY THIS STEP EXISTS, and why it cannot be a committed value.
+      #
+      # Kong validates every API token itself, in DB-less mode, against one
+      # credential in kong.yml. That credential has to match the realm that is
+      # actually running, in TWO ways, and the committed file cannot satisfy
+      # either:
+      #
+      #   the lookup key — Kong's jwt plugin finds the credential BY the
+      #   token's `iss` claim. Committed value is http://localhost:8080/...,
+      #   production issues https://${AUTH_HOST}/..., so nothing matches.
+      #
+      #   the public key — sanitise-realm-export.py deliberately strips the
+      #   realm's *KeyProvider components, because a realm's signing material
+      #   must never be committed to a public repository. Keycloak therefore
+      #   mints new keys when it first imports the realm. The correct value
+      #   does not exist until that has happened, so it can only be discovered
+      #   here.
+      #
+      # Measured before this existed: signup and login both succeeded, the app
+      # shell rendered at /projects/1/dashboard, and every API call behind it
+      # returned 401. The stack looked up and was unusable.
+      - name: supply the running realm's public key to Kong and the services
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/vedan
+            AUTH_HOST=$(grep -E '^AUTH_HOST=' .env | cut -d= -f2-)
+            ISSUER="https://${AUTH_HOST}/realms/srckube"
+
+            # Keycloak is started, not necessarily ready: it imports the realm
+            # and builds its key set on first boot, and the key we need does
+            # not exist until that finishes.
+            for i in $(seq 1 40); do
+              curl -fsS --max-time 5 "$ISSUER" >/dev/null 2>&1 && break
+              [ "$i" = 40 ] && { echo "$ISSUER never became ready"; exit 1; }
+              sleep 3
+            done
+
+            # The SAME stale key appears in two places, and both reject
+            # tokens. Kong validates with it at the edge; each of the 18
+            # services validates with it again, offline, through
+            # keycloak-connect's realm-public-key. Fixing only Kong turns
+            # 401 into 403 and the app is still unusable — measured.
+            KEY=$(curl -fsS --max-time 10 "$ISSUER" \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["public_key"])')
+            test -n "$KEY" || { echo "realm returned no public_key"; exit 1; }
+
+            env_before=$(sha256sum .env.runtime | cut -d' ' -f1)
+            printf 'KEYCLOAK_REALM_PUBLIC_KEY=%s\n' "$KEY" > .env.runtime
+            env_after=$(sha256sum .env.runtime | cut -d' ' -f1)
+
+            kong_before=$(sha256sum kong.yml | cut -d' ' -f1)
+            python3 render-kong-jwt.py kong.yml "$ISSUER"
+            kong_after=$(sha256sum kong.yml | cut -d' ' -f1)
+
+            # Re-apply so the services pick up the key. Compose recreates only
+            # containers whose configuration actually changed, so in steady
+            # state (same realm, same key) this is a no-op.
+            if [ "$env_before" != "$env_after" ]; then
+              echo "realm public key changed; re-applying so services pick it up"
+              docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
+                -f docker-compose.prod.yml -f docker-compose.edge.yml up -d --remove-orphans
+            else
+              echo "realm public key unchanged"
+            fi
+
+            # Kong reads kong.yml once at boot. Restart only on a real change,
+            # so a routine deploy does not drop the API for no reason.
+            if [ "$kong_before" != "$kong_after" ]; then
+              docker restart kong
+              for i in $(seq 1 30); do
+                [ "$(docker inspect -f '{{.State.Health.Status}}' kong 2>/dev/null)" = healthy ] && break
+                sleep 2
+              done
+              docker inspect -f 'kong: {{.State.Health.Status}}' kong
+            else
+              echo "kong.yml unchanged; no restart needed"
+            fi
