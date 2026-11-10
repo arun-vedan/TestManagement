@@ -11958,3 +11958,142 @@ The dev server was restarted detached (`nohup`, reparented to PID 1) after my
 earlier background-task restart hit its two-hour limit and took the server down
 with it. A long-lived process of the owner's should never have been tied to a
 session's lifetime. Its log is at `~/vedan-devserver.log`, outside the repo.
+
+---
+
+## Production login: closing the gap between "containers start" and "a person signs in"
+
+Date: 2026-11-10. No WP; this is the acceptance of the VPS deployment work.
+
+### What the previous verification actually proved, and what it did not
+
+The deployment was reported done on the strength of: 25 containers running,
+real Let's Encrypt certificates on all three hostnames, `app.vedan.io` serving
+200, `auth.vedan.io` issuing `https://auth.vedan.io/realms/srckube`, and a
+login page returning 200 with `name="username"`, `name="password"` and a
+registration link in the HTML.
+
+All of that was true. None of it proved anyone could sign in.
+
+**The auth UI is Vue-rendered.** The served HTML for both the login and the
+signup page contains *no `<form>` element at all* — Quasar builds it at
+runtime from a `#register-seed` block. So every curl-based check could only
+establish that the templates were being served. Worse, the password fields
+that WP-137 exists to produce are `q-input` components, and `name="password"`
+appearing in the document was matched by a grep against the whole file, not
+against a rendered input. That is the same mistake class as the `terms.ftl`
+inverted-consent bug: a Vue component in a form's submit path, verified by
+curl, which bypassed the component entirely.
+
+Driven in a real browser (Playwright, Chromium) instead:
+
+```
+app.vedan.io          -> 302 to Keycloak, PKCE S256       the app initiates auth
+login page            -> username/password inputs VISIBLE  Quasar mounted
+                         0 console errors, 0 failed requests  CDN assets load
+signup page           -> password + password-confirm filled  WP-137 holds
+submit                -> required-action=TERMS_AND_CONDITIONS WP-155 armed
+Accept                -> https://app.vedan.io/projects/1/dashboard  consent recorded
+```
+
+Quasar replaces each input's `id` with a generated `f_<uuid>` but **preserves
+`name=`** on the native element, and does build a real `<form method="post">`.
+Name-based selectors are the reliable ones for this theme.
+
+### The defect this uncovered
+
+Signup, terms and login all worked. Then all eight of the dashboard's API
+calls returned 401. The stack looked healthy and was unusable.
+
+One root cause in two places, because the realm's public key is committed
+twice:
+
+| Where | Committed value | What production needs |
+|---|---|---|
+| `srckube-kong/kong.yml` credential `key` | `http://localhost:8080/realms/srckube` | `https://auth.vedan.io/realms/srckube` |
+| same credential `rsa_public_key` | dev realm key (`…pG40fN…`) | prod realm key (`…At37g4l…`) |
+| `KeyCloak_publicKey`, ×18 services | dev realm key (`…pG40fN…`) | prod realm key |
+
+Kong's jwt plugin looks its credential up **by the token's `iss` claim**, so a
+mismatched `key` means no credential matches and everything is 401. Each
+service then validates the token *again*, offline, through keycloak-connect's
+`realm-public-key` — so fixing only Kong moved the failure rather than
+removing it:
+
+```
+before             GET /api/v1/projects  401  Kong, no matching credential
+kong.yml repointed GET /api/v1/projects  403  "Access denied"  keycloak-connect
+services repointed GET /api/v1/projects  200
+```
+
+The 403 body was the load-bearing clue, and this log already contained its
+meaning: line 1077 records keycloak-connect rejecting on **issuer mismatch**
+with exactly that string. That is what stopped me attributing the 403 to
+missing project membership, which was the obvious-looking and wrong answer.
+I had made that error before — verifying a mechanism and never its
+attribution — and the fix was to read the response body rather than infer
+from the status code.
+
+### Why neither value could simply be corrected and committed
+
+`sanitise-realm-export.py` deliberately strips the realm's `*KeyProvider`
+components, because publishing a realm's signing material to a public
+repository would be catastrophic. Keycloak therefore **mints fresh keys the
+first time it imports the realm**. The correct values do not exist until that
+has happened, and they change again whenever the realm is recreated.
+
+So these 401s were never a misconfiguration to correct once. They are the
+standing consequence of a decision that is right, and they return on every
+realm rebuild. That is why the fix is a deploy step and not a new committed
+constant.
+
+### The fix
+
+- **`deploy/render-kong-jwt.py`** repoints Kong's credential from the running
+  realm. Targeted text substitution, *not* a YAML round-trip: `kong.yml`
+  carries 247 comment lines explaining individual routes, and `yaml.safe_dump`
+  would silently delete all of them. Scoped to the named consumer (the file
+  has a second consumer and 31 jwt plugin blocks), refuses to proceed unless
+  it matches exactly one credential, and is idempotent.
+- **`generate-prod-compose.py`** rewrites `KeyCloak_publicKey` to
+  `${KEYCLOAK_REALM_PUBLIC_KEY}` for all 18 services, so the stale literal
+  cannot drift back. Regeneration diff: exactly 18 lines, nothing else.
+- **`deploy.yml`** waits for the realm, fetches the key, writes
+  `.env.runtime`, renders `kong.yml`, and re-applies — restarting Kong and
+  recreating services **only when the value actually changed**, so a routine
+  deploy does not drop the API.
+
+It is wired into the workflow and committed, not applied by hand. Applying it
+only on the server is how the Traefik v3.7 fix was lost earlier: the next
+deploy restored the broken committed version.
+
+### Verification
+
+```
+GET /api/v1/projects, authenticated in a real browser   200
+Kong route sweep, 32 /api/v1 routes, unauthenticated    30 x 401 at Kong
+  executionIngestRoute 403, apiKeysDemoRoute 404        config.anonymous,
+                                                        upstream decides (WP-032)
+containers                                              20 healthy, 0 unhealthy
+render-kong-jwt.py run twice                            idempotent
+kong.yml after render                                   parses, 53 services,
+                                                        2 consumers, 247 comments
+deploy.yml                                              valid YAML, 6 steps
+```
+
+### Not fixed, recorded as candidates
+
+- **A self-registered user lands on `/projects/1/dashboard`**, a project they
+  are not a member of, and gets seven 403s. The app handles it gracefully
+  ("You are not a member of this project yet. Ask a project admin to add you
+  to see dashboard data."), so it is not broken — but open signup currently
+  routes a new user to a hardcoded project rather than to an empty state or
+  onboarding. Product decision, outside this scope.
+- **`login-status-iframe.html/init` is aborted** by the browser on every load.
+  Keycloak's session-status iframe; harmless here, worth a look if silent
+  session expiry is ever reported.
+- **Three test accounts** were created on production while verifying this
+  (`smoke1794287412153`, `smoke1794287619975`, `smoke1794288020038`). They
+  could not be removed: the Keycloak admin credentials are not in
+  `/opt/vedan/.env` under any `*ADMIN*` name, and reading a client secret was
+  correctly refused. **Owner action: delete these three users.**
