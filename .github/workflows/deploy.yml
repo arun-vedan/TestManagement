@@ -228,6 +228,12 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
+          # Explicit, because the default is 10m and this step pulls 20 images
+          # on a 2 vCPU box, restarts Keycloak and waits for it to answer. A
+          # readiness bug of mine spent ~6 minutes of that budget on a loop
+          # that could never succeed, which was close enough to the default to
+          # have failed deploys for a reason nothing would have explained.
+          command_timeout: 20m
           # The token is passed on stdin rather than as an argument, so it
           # cannot be read out of the process list.
           script: |

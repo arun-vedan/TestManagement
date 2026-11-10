@@ -94,8 +94,17 @@ if docker exec keycloak test -f /opt/keycloak/themes/kdk/login/login.ftl 2>/dev/
 else
   echo "keycloak CANNOT see the kdk theme (stale mount) -- restarting"
   docker restart keycloak
+  # Polls $ISSUER, the PUBLIC url, not http://localhost:8080. Production
+  # publishes no container ports at all -- generate-prod-compose.py strips
+  # every `ports:` so nothing but Traefik binds to the host -- so
+  # localhost:8080 on the host is refused outright (curl exit 7). The first
+  # version of this loop used it and therefore never checked readiness at
+  # all: it just slept the full 50 x (4 + 3) seconds and carried on, which
+  # added about six minutes to every deploy that touched the theme and came
+  # close to ssh-action's ten-minute command timeout. A readiness check that
+  # cannot ever succeed is worse than none, because it looks like one.
   for _ in $(seq 1 50); do
-    if curl -fsS --max-time 4 http://localhost:8080/realms/srckube >/dev/null 2>&1; then
+    if curl -fsS --max-time 4 "$ISSUER" >/dev/null 2>&1; then
       break
     fi
     sleep 3
