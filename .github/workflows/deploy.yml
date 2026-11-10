@@ -211,13 +211,36 @@ jobs:
             # .env lives ONLY on the server and is never in the repo or in
             # this workflow: it holds the Keycloak secret, Mongo passwords
             # and the credential keys.
+            # Keep a copy of this step's output ON THE SERVER. Reading an
+            # Actions log needs a token this project does not have to hand,
+            # and three deploys were debugged by inference because of it.
+            # Bounded: a deploy log nobody prunes becomes the reason a disk
+            # fills, and this box has already lost Kong and MongoDB to a full
+            # Docker VM once.
+            if [ -f deploy.log ] && [ "$(stat -c %s deploy.log)" -gt 2000000 ]; then
+              tail -c 500000 deploy.log > deploy.log.tmp && mv -f deploy.log.tmp deploy.log
+            fi
+            exec > >(tee -a deploy.log) 2>&1
+            echo "=== $(date -u +%FT%TZ) deploy ${{ github.sha }} ==="
+
             test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
             echo "IMAGE_TAG=${{ github.sha }}" > .env.tag
+
             # Holds the realm public key, which only exists once Keycloak has
-            # booted (see the repoint step below). Created empty if absent so
-            # the --env-file reference below cannot fail on a first deploy;
-            # the repoint step then fills it and re-applies.
-            touch .env.runtime
+            # booted (see the repoint step below). It must exist before the
+            # --env-file reference below.
+            #
+            # NOT `touch`: touch on an existing file needs write permission on
+            # the FILE, and a file left in /opt/vedan by root makes it fail
+            # with "Permission denied" -- which is exactly what killed the two
+            # deploys after this file was first created by hand as root. Going
+            # through a rename needs write permission on the DIRECTORY, which
+            # the deploy user has, so it works whoever owns the old file.
+            # Same failure mode as the stale root-owned bind-mount dirs that
+            # broke the unpack step earlier in this project's history.
+            if [ ! -f .env.runtime ]; then
+              : > .env.runtime.tmp && mv -f .env.runtime.tmp .env.runtime
+            fi
             docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
             docker compose --env-file .env --env-file .env.tag --env-file .env.runtime \
               -f docker-compose.prod.yml -f docker-compose.edge.yml pull --quiet
@@ -259,6 +282,8 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/vedan
+            exec > >(tee -a deploy.log) 2>&1
+            echo "=== $(date -u +%FT%TZ) repoint ${{ github.sha }} ==="
             AUTH_HOST=$(grep -E '^AUTH_HOST=' .env | cut -d= -f2-)
             ISSUER="https://${AUTH_HOST}/realms/srckube"
 
@@ -280,8 +305,10 @@ jobs:
                   | python3 -c 'import json,sys; print(json.load(sys.stdin)["public_key"])')
             test -n "$KEY" || { echo "realm returned no public_key"; exit 1; }
 
-            env_before=$(sha256sum .env.runtime | cut -d' ' -f1)
-            printf 'KEYCLOAK_REALM_PUBLIC_KEY=%s\n' "$KEY" > .env.runtime
+            env_before=$(sha256sum .env.runtime 2>/dev/null | cut -d' ' -f1 || echo none)
+            # Through a rename, so ownership of the previous file is irrelevant.
+            printf 'KEYCLOAK_REALM_PUBLIC_KEY=%s\n' "$KEY" > .env.runtime.tmp
+            mv -f .env.runtime.tmp .env.runtime
             env_after=$(sha256sum .env.runtime | cut -d' ' -f1)
 
             kong_before=$(sha256sum kong.yml | cut -d' ' -f1)
