@@ -148,7 +148,7 @@ jobs:
           cp deploy/docker-compose.prod.yml deploy/docker-compose.edge.yml bundle/
           cp srckube-kong/kong.yml bundle/kong.yml
           cp deploy/render-kong-jwt.py bundle/
-          cp -r keycloak-themes/themes/kdk keycloak-themes/themes/kapp bundle/themes/
+          cp -r keycloak-themes/themes/kdk bundle/themes/
           cp keycloak-themes/realm/srckube-realm.json bundle/realm/
           tar -czf bundle.tgz -C bundle .
           # NOT `tar -tzf ... | head`: under `set -o pipefail`, head closing
@@ -189,9 +189,22 @@ jobs:
             # permission on the PARENT (deploy owns /opt/vedan), not on the
             # directory itself. Done before every extract so a stale mount
             # directory can never shadow real content.
+            # Fingerprint the bind-mounted content so the step below knows
+            # whether Keycloak has to be restarted. Cheap, and it keeps a
+            # routine deploy from bouncing the identity provider for nothing.
+            fp() { find themes realm -type f -exec sha256sum {} + 2>/dev/null \
+                   | sort | sha256sum | cut -d' ' -f1; }
+            before=$(fp)
             rm -rf kong.yml themes realm render-kong-jwt.py
             tar -xzf bundle.tgz
             rm -f bundle.tgz
+            if [ "$before" != "$(fp)" ]; then
+              : > .themes-changed.tmp && mv -f .themes-changed.tmp .themes-changed
+              echo "themes/realm changed"
+            else
+              rm -f .themes-changed
+              echo "themes/realm unchanged"
+            fi
             # No `| head` here. Under pipefail that is a SIGPIPE waiting to
             # fail the step, which is what broke the staging step one commit
             # ago.
@@ -220,7 +233,15 @@ jobs:
             if [ -f deploy.log ] && [ "$(stat -c %s deploy.log)" -gt 2000000 ]; then
               tail -c 500000 deploy.log > deploy.log.tmp && mv -f deploy.log.tmp deploy.log
             fi
-            exec > >(tee -a deploy.log) 2>&1
+            # A PLAIN redirect, with the tail echoed back on exit. The first
+            # attempt used `exec > >(tee -a deploy.log)`, and process
+            # substitution cost a deploy: the shell does not wait for the
+            # background tee, so the log was truncated mid-step AND the step
+            # died before restarting Kong -- which left Kong serving a stale
+            # config while every file on disk looked correct.
+            exec 3>&1
+            exec >> deploy.log 2>&1
+            trap 'rc=$?; tail -80 /opt/vedan/deploy.log >&3; exit $rc' EXIT
             echo "=== $(date -u +%FT%TZ) deploy ${{ github.sha }} ==="
 
             test -f .env || { echo "/opt/vedan/.env is missing"; exit 1; }
@@ -282,8 +303,25 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/vedan
-            exec > >(tee -a deploy.log) 2>&1
+            exec 3>&1
+            exec >> deploy.log 2>&1
+            trap 'rc=$?; tail -80 /opt/vedan/deploy.log >&3; exit $rc' EXIT
             echo "=== $(date -u +%FT%TZ) repoint ${{ github.sha }} ==="
+
+            # Bind mounts resolve to an INODE at container start, and the
+            # unpack step replaces themes/ and realm/ wholesale -- so a
+            # container that compose did not recreate stays mounted on the
+            # directory that was deleted. Kong escapes it only because it is
+            # restarted below; Keycloak is never recreated (its configuration
+            # does not change between deploys), so it kept serving a theme
+            # directory that no longer existed, fell back to parent=base, and
+            # rendered a login page with no form on it at all. The page was
+            # 200 and every file on disk was correct.
+            if [ -f .themes-changed ]; then
+              echo "theme or realm files changed; restarting keycloak to re-resolve its mounts"
+              docker restart keycloak
+              rm -f .themes-changed
+            fi
             AUTH_HOST=$(grep -E '^AUTH_HOST=' .env | cut -d= -f2-)
             ISSUER="https://${AUTH_HOST}/realms/srckube"
 
